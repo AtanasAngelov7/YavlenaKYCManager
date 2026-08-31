@@ -5,6 +5,7 @@ from __future__ import annotations
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime
+import re
 
 from models import PersonalDocument
 
@@ -85,6 +86,14 @@ def validate_document(document: PersonalDocument) -> list[ValidationIssue]:
 
     if document.personal_number and not is_valid_egn(document.personal_number):
         issues.append(ValidationIssue("personal_number", "The EGN date or checksum is invalid."))
+
+    if document.document_number and not re.fullmatch(r"\d{9}", document.document_number):
+        issues.append(
+            ValidationIssue(
+                "document_number",
+                "The supported Bulgarian identity-card number must contain exactly 9 digits.",
+            )
+        )
 
     normalized_dates: dict[str, str] = {}
     for field in ("date_of_birth", "issued_on", "expires_on"):

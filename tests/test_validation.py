@@ -30,3 +30,11 @@ def test_document_date_must_match_egn() -> None:
     issues = validate_document(document)
 
     assert any(issue.field == "date_of_birth" and "EGN" in issue.message for issue in issues)
+
+
+def test_supported_identity_card_number_must_have_exactly_nine_digits() -> None:
+    invalid = validate_document(PersonalDocument(document_number="X123"))
+    valid = validate_document(PersonalDocument(document_number="123456789"))
+
+    assert any(issue.field == "document_number" for issue in invalid)
+    assert not any(issue.field == "document_number" for issue in valid)

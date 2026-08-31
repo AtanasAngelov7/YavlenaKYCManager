@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Build a small, local application that turns a scanned personal document into structured data, lets the operator review that data, enters the approved values into a website, downloads the resulting documents, and saves them to the local filesystem.
+Build a small, local application that turns a scanned personal document into structured data, lets the operator review and save that data, enters the saved values into a website, generates controlled contract drafts, and saves artifacts to the local filesystem.
 
 The application is intended for a single operator and will process one case at a time. The first version should remain simple and should not introduce server infrastructure unless it becomes necessary.
 
@@ -42,11 +42,11 @@ No paid OCR service is required. Personal documents remain on the local computer
 6. A document-specific parser maps recognized text to structured fields.
 7. Deterministic checks validate values such as EGN, dates, document numbers, and MRZ check digits where available.
 8. The application displays an editable review form.
-9. The operator corrects values and explicitly approves them.
-10. Playwright opens a visible browser. The operator completes login, MFA, or CAPTCHA when required.
-11. The application fills the target website and pauses before final submission where practical.
-12. After confirmation, the application submits the data and downloads generated documents.
-13. The documents and final JSON are saved in the case directory.
+9. The operator corrects and saves the identity snapshot; the local POC has no blocking approval checkbox.
+10. The operator independently chooses contract generation, RMS filling, or both.
+11. Playwright opens a visible browser, signs in from local credentials, fills the supported RMS identity/document/address pages, and remains open for review.
+12. RMS contact data, risk questions, final submission, and PDF retrieval remain manual.
+13. Generated contract drafts, provenance records, and final JSON are saved in the case directory.
 
 OCR output must never be submitted without operator review in the first version.
 
@@ -64,6 +64,8 @@ The initial structured result will contain fields similar to:
   "personal_number": "8504120000",
   "document_number": "123456789",
   "date_of_birth": "1985-04-12",
+  "birth_place": "гр. София",
+  "citizenship": "България",
   "issued_on": "2024-01-10",
   "expires_on": "2034-01-10",
   "address": "гр. София, ..."
@@ -173,7 +175,7 @@ The first usable version is complete when an operator can:
 
 1. Upload the front and back sides of one supported personal-document type.
 2. Receive a mostly populated, editable form.
-3. Correct and approve the extracted values.
+3. Correct and save the extracted values.
 4. Open the target website and populate its form.
-5. Confirm submission.
-6. Download the resulting document into the correct local case directory.
+5. Review the populated RMS pages without automatic submission.
+6. Generate and download a controlled Bulgarian buyer or one-seller contract draft.

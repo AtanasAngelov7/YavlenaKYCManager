@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest_tmp/
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 .venv/
@@ -12,6 +13,7 @@ venv/
 # Local application data (may contain personal data)
 cases/*
 !cases/.gitkeep
+documents/example_docs/
 *.auth.json
 playwright/.auth/
 

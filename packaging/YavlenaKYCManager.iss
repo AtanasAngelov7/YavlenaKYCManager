@@ -1,5 +1,5 @@
 #define AppName "Yavlena KYC Manager"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppPublisher "Yavlena"
 #define AppExeName "YavlenaKYCManager.exe"
 
@@ -7,6 +7,7 @@
 AppId={{0E58D9B3-9BC7-48D6-8912-93D48EAE30A0}
 AppName={#AppName}
 AppVersion={#AppVersion}
+VersionInfoVersion=0.1.1.0
 AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}

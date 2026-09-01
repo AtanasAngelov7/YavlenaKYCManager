@@ -10,7 +10,7 @@
 
 ## Потребителски процес
 
-1. Потребителят стартира `YavlenaKYCManager-Setup-0.1.0.exe`.
+1. Потребителят стартира `YavlenaKYCManager-Setup-0.1.1.exe`.
 2. Installer-ът поставя приложението в профила на текущия Windows потребител. Не са нужни администраторски права.
 3. По избор се създава desktop shortcut.
 4. При стартиране приложението избира свободен локален порт и отваря интерфейса в браузъра по подразбиране.
@@ -62,7 +62,7 @@ Build машината е единствената, която има нужда
 4. изпълнява целия тестов пакет;
 5. създава `dist\YavlenaKYCManager\YavlenaKYCManager.exe`;
 6. изпълнява автоматичния frozen smoke gate;
-7. създава `dist\installer\YavlenaKYCManager-Setup-0.1.0.exe`.
+7. създава `dist\installer\YavlenaKYCManager-Setup-0.1.1.exe`.
 
 `-SkipInstaller` може да се използва само за проверка на PyInstaller bundle-а.
 

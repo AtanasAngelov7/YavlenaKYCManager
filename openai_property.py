@@ -6,8 +6,6 @@ import hashlib
 import json
 import os
 import re
-import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -19,10 +17,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from models import OcrLine, PersonalDocument, PropertyDocument, PropertyDocumentType
 from parsers.bulgarian_deed import parse_bulgarian_property_document, seller_name_is_present
 from validation import normalize_date
+from runtime_paths import RESOURCE_ROOT, SETTINGS_PATH
+from local_settings import remove_env_values, update_env_values
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+PROJECT_ROOT = RESOURCE_ROOT
+DEFAULT_ENV_PATH = SETTINGS_PATH
 DEFAULT_OPENAI_MODEL = "gpt-5.6"
 OPENAI_PROMPT_VERSION = "property-ocr-v1"
 MAX_AI_OCR_LINES = 1_000
@@ -131,7 +131,7 @@ AI_FIELD_NAMES = tuple(
 def load_openai_settings(env_path: Path = DEFAULT_ENV_PATH) -> OpenAISettings | None:
     """Return optional OpenAI settings without mutating the process environment."""
 
-    file_values = dotenv_values(env_path) if env_path.is_file() else {}
+    file_values = dotenv_values(env_path, interpolate=False) if env_path.is_file() else {}
     api_key = (os.getenv("OPENAI_API_KEY") or file_values.get("OPENAI_API_KEY") or "").strip()
     model = (os.getenv("OPENAI_MODEL") or file_values.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL).strip()
     if not api_key:
@@ -151,47 +151,18 @@ def save_openai_settings(
     cleaned_model = model.strip()
     _validate_settings(cleaned_key, cleaned_model)
 
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
-    updated: list[str] = []
-    replaced: set[str] = set()
     settings = {
         "OPENAI_API_KEY": cleaned_key,
         "OPENAI_MODEL": cleaned_model,
     }
-    setting_pattern = re.compile(r"^(?:export\s+)?(OPENAI_API_KEY|OPENAI_MODEL)\s*=")
-    for line in lines:
-        match = setting_pattern.match(line.strip())
-        if match is None:
-            updated.append(line)
-            continue
-        name = match.group(1)
-        if name not in replaced:
-            updated.append(f"{name}={settings[name]}")
-            replaced.add(name)
-    if updated and updated[-1].strip():
-        updated.append("")
-    for name, value in settings.items():
-        if name not in replaced:
-            updated.append(f"{name}={value}")
-
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = env_path.with_name(f".{env_path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
-        for attempt in range(20):
-            try:
-                temporary.replace(env_path)
-                break
-            except PermissionError:
-                if attempt == 19:
-                    raise
-                time.sleep(0.005 * (attempt + 1))
-    finally:
-        temporary.unlink(missing_ok=True)
-
-    os.environ["OPENAI_API_KEY"] = cleaned_key
-    os.environ["OPENAI_MODEL"] = cleaned_model
+    update_env_values(env_path, settings)
     return OpenAISettings(api_key=cleaned_key, model=cleaned_model)
+
+
+def remove_openai_settings(env_path: Path = DEFAULT_ENV_PATH) -> None:
+    """Remove only OpenAI credentials and model selection from local settings."""
+
+    remove_env_values(env_path, ("OPENAI_API_KEY", "OPENAI_MODEL"))
 
 
 def verify_openai_settings(settings: OpenAISettings, client: Any | None = None) -> None:

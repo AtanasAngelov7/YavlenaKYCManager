@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
@@ -11,12 +13,19 @@ from tempfile import TemporaryDirectory
 import streamlit as st
 from pydantic import ValidationError
 
-from contracts import ContractGenerationError, generate_contract
+from contracts import (
+    ContractGenerationError,
+    contract_input_matches_active_sources,
+    generate_contract,
+)
 from image_processing import DocumentProcessingError, prepare_document
 from models import (
     AgentDetails,
+    ApprovedIdentitySnapshot,
     BinaryChoice,
+    CasePaths,
     ContactDetails,
+    ContractManifest,
     ContractInput,
     ContractOptions,
     ContractRole,
@@ -36,6 +45,7 @@ from openai_property import (
     OpenAISettings,
     extract_property_details_with_openai,
     load_openai_settings,
+    remove_openai_settings,
     save_openai_settings,
     verify_openai_settings,
 )
@@ -48,27 +58,262 @@ from parsers import (
 )
 from storage import (
     MAX_UPLOAD_BYTES,
+    case_mutation_lock,
     create_case,
+    delete_local_case,
     existing_case_paths,
     file_sha256,
+    list_case_cleanup_residue,
+    list_local_cases,
     promote_property_candidate,
+    read_validated_identity_snapshot,
+    retry_case_cleanup,
     save_original,
     write_json,
 )
 from validation import normalize_date, validate_document
+from runtime_paths import CASES_ROOT, ensure_runtime_directories, is_frozen
 from website import (
     ACTIVE_STATES,
     WebsiteAutomationError,
+    WebsiteNotConfiguredError,
+    force_close_rms_automation,
     identity_field_values,
     launch_rms_automation,
+    load_rms_credentials,
     read_rms_status,
+    request_rms_automation_stop,
     rms_identity_issues,
     rms_status_is_active,
+    rms_stop_request_is_pending,
     rms_worker_is_active,
+    remove_rms_credentials,
+    save_rms_credentials,
+    validated_rms_pdf_path,
 )
 
 
 st.set_page_config(page_title="Yavlena KYC Manager", page_icon="📄", layout="wide")
+
+
+YAVLENA_THEME_CSS = """
+<style>
+    :root {
+        --yavlena-green: #3b8122;
+        --yavlena-green-hover: #306b1c;
+        --yavlena-green-active: #285b17;
+        --yavlena-green-soft: #edf6e9;
+        --yavlena-ink: #24364b;
+        --yavlena-ink-hover: #17283b;
+        --yavlena-heading: #1f2f41;
+        --yavlena-text: #465568;
+        --yavlena-muted: #6f7d8c;
+        --yavlena-surface: #ffffff;
+        --yavlena-background: #f3f5f2;
+        --yavlena-border: #cfd7cd;
+        --yavlena-danger: #9f2d25;
+        --yavlena-danger-hover: #84221c;
+        --yavlena-danger-soft: #fff5f3;
+        --yavlena-disabled-bg: #e2e7e0;
+        --yavlena-disabled-text: #596659;
+    }
+
+    [data-testid="stAppViewContainer"] {
+        background: var(--yavlena-background);
+        color: var(--yavlena-text);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(255, 255, 255, 0.96);
+        border-bottom: 1px solid var(--yavlena-border);
+    }
+
+    [data-testid="stSidebar"] > div:first-child {
+        background: var(--yavlena-surface);
+        border-right: 1px solid var(--yavlena-border);
+    }
+
+    h1, h1 span {
+        color: var(--yavlena-heading) !important;
+        letter-spacing: -0.025em;
+    }
+
+    h1 {
+        border-left: 0.38rem solid var(--yavlena-green);
+        padding-left: 0.85rem;
+    }
+
+    h2, h3, h4, h5, h6,
+    [data-testid="stMetricLabel"],
+    [data-testid="stMetricValue"] {
+        color: var(--yavlena-heading);
+    }
+
+    [data-testid="stCaptionContainer"],
+    [data-testid="stWidgetLabel"] {
+        color: var(--yavlena-text);
+    }
+
+    a {
+        color: var(--yavlena-green-hover);
+    }
+
+    hr {
+        border-color: var(--yavlena-border);
+    }
+
+    [data-testid="stVerticalBlockBorderWrapper"],
+    [data-testid="stForm"],
+    [data-testid="stExpander"] {
+        background: var(--yavlena-surface);
+        border-color: var(--yavlena-border);
+        border-radius: 0.75rem;
+        box-shadow: 0 1px 2px rgba(31, 47, 65, 0.06);
+    }
+
+    /* Current Streamlit uses stBaseButton-* test IDs; kind is kept as a fallback. */
+    button[data-testid^="stBaseButton-primary"],
+    button[kind^="primary"] {
+        background: var(--yavlena-green);
+        border: 1px solid var(--yavlena-green);
+        color: #ffffff;
+        box-shadow: 0 2px 5px rgba(48, 107, 28, 0.24);
+    }
+
+    button[data-testid^="stBaseButton-primary"]:hover,
+    button[kind^="primary"]:hover {
+        background: var(--yavlena-green-hover);
+        border-color: var(--yavlena-green-hover);
+        color: #ffffff;
+    }
+
+    button[data-testid^="stBaseButton-secondary"],
+    button[kind^="secondary"] {
+        background: var(--yavlena-ink);
+        border: 1px solid var(--yavlena-ink);
+        color: #ffffff;
+        box-shadow: 0 1px 3px rgba(23, 40, 59, 0.18);
+    }
+
+    button[data-testid^="stBaseButton-secondary"]:hover,
+    button[kind^="secondary"]:hover {
+        background: var(--yavlena-ink-hover);
+        border-color: var(--yavlena-ink-hover);
+        color: #ffffff;
+    }
+
+    button[data-testid^="stBaseButton-tertiary"],
+    button[kind^="tertiary"] {
+        background: var(--yavlena-danger-soft);
+        border: 1px solid var(--yavlena-danger);
+        color: var(--yavlena-danger);
+        box-shadow: none;
+    }
+
+    button[data-testid^="stBaseButton-tertiary"]:hover,
+    button[kind^="tertiary"]:hover {
+        background: var(--yavlena-danger-hover);
+        border-color: var(--yavlena-danger-hover);
+        color: #ffffff;
+    }
+
+    [data-testid="stDownloadButton"] button {
+        background: var(--yavlena-green);
+        border: 1px solid var(--yavlena-green);
+        color: #ffffff;
+        box-shadow: 0 2px 5px rgba(48, 107, 28, 0.24);
+    }
+
+    [data-testid="stDownloadButton"] button:hover {
+        background: var(--yavlena-green-hover);
+        border-color: var(--yavlena-green-hover);
+        color: #ffffff;
+    }
+
+    button[data-testid^="stBaseButton-"]:not([kind^="header"]),
+    [data-testid="stDownloadButton"] button {
+        min-height: 2.65rem;
+        border-radius: 0.5rem;
+        font-weight: 650;
+        transition: background-color 120ms ease, border-color 120ms ease,
+            box-shadow 120ms ease, transform 80ms ease;
+    }
+
+    button[data-testid^="stBaseButton-"]:not([kind^="header"]):active,
+    [data-testid="stDownloadButton"] button:active {
+        transform: translateY(1px);
+    }
+
+    button[data-testid^="stBaseButton-"]:disabled,
+    button[data-testid^="stBaseButton-"][aria-disabled="true"],
+    [data-testid="stDownloadButton"] button:disabled {
+        background: var(--yavlena-disabled-bg) !important;
+        border-color: #c4ccc2 !important;
+        color: var(--yavlena-disabled-text) !important;
+        box-shadow: none !important;
+        cursor: not-allowed;
+        opacity: 1;
+    }
+
+    button:focus-visible,
+    a:focus-visible {
+        outline: 3px solid rgba(59, 129, 34, 0.42);
+        outline-offset: 2px;
+    }
+
+    [data-baseweb="input"] > div,
+    [data-baseweb="textarea"] > div,
+    [data-baseweb="select"] > div {
+        background: var(--yavlena-surface);
+        border-color: var(--yavlena-border);
+    }
+
+    [data-baseweb="input"] > div:focus-within,
+    [data-baseweb="textarea"] > div:focus-within,
+    [data-baseweb="select"] > div:focus-within {
+        border-color: var(--yavlena-green);
+        box-shadow: 0 0 0 1px var(--yavlena-green);
+    }
+
+    [data-testid="stFileUploaderDropzone"] {
+        background: var(--yavlena-surface);
+        border-color: var(--yavlena-muted);
+    }
+
+    [data-testid="stFileUploaderDropzone"] button {
+        background: var(--yavlena-green);
+        border: 1px solid var(--yavlena-green);
+        color: #ffffff;
+        box-shadow: 0 1px 3px rgba(48, 107, 28, 0.2);
+    }
+
+    [data-testid="stFileUploaderDropzone"] button:hover {
+        background: var(--yavlena-green);
+        border-color: var(--yavlena-green);
+        color: #ffffff;
+    }
+
+    [data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {
+        background: var(--yavlena-green-soft);
+        color: var(--yavlena-heading);
+    }
+
+    [role="progressbar"] > div {
+        background: var(--yavlena-green);
+    }
+
+    input[type="checkbox"],
+    input[type="radio"] {
+        accent-color: var(--yavlena-green);
+    }
+</style>
+"""
+
+
+def _apply_company_theme() -> None:
+    """Apply the public Yavlena palette without changing Streamlit's structure."""
+
+    st.markdown(YAVLENA_THEME_CSS, unsafe_allow_html=True)
 
 
 @st.cache_resource(show_spinner=False)
@@ -77,11 +322,17 @@ def get_ocr_engine() -> PaddleOcrEngine:
 
 
 def main() -> None:
+    ensure_runtime_directories()
+    _apply_company_theme()
     _render_openai_settings()
     st.title("Yavlena KYC Manager")
     st.caption("Local document extraction with a compact editable review")
+    case_notice = st.session_state.pop("case-notice", "")
+    if case_notice:
+        st.success(case_notice)
 
     _render_privacy_notice()
+    _render_case_manager()
     front_column, back_column = st.columns(2)
     with front_column:
         front = st.file_uploader(
@@ -103,15 +354,12 @@ def main() -> None:
     if oversized:
         st.error(f"These uploads exceed the 25 MB limit: {', '.join(oversized)}")
 
-    rms_worker_active = _current_case_rms_worker_is_active()
-    if rms_worker_active:
-        st.warning("Close the active RMS browser before starting another identity case.")
     ready = front is not None and back is not None and not oversized
     if st.button(
         "Extract both sides",
         type="primary",
         use_container_width=True,
-        disabled=not ready or rms_worker_active,
+        disabled=not ready,
     ):
         _extract(front.name, front.getvalue(), back.name, back.getvalue())
 
@@ -121,20 +369,101 @@ def main() -> None:
 
 
 def _render_openai_settings() -> None:
-    """Keep optional external processing configuration compact and out of case data."""
+    """Keep local credentials and optional AI configuration out of case data."""
 
     key_widget = "settings-openai-api-key"
-    if st.session_state.pop("settings-clear-openai-key", False):
-        st.session_state.pop(key_widget, None)
+    if st.session_state.pop("settings-reset-rms-widgets", False):
+        for key in (
+            "settings-rms-email",
+            "settings-rms-password",
+            "settings-remove-rms-confirmed",
+        ):
+            st.session_state.pop(key, None)
+    if st.session_state.pop("settings-reset-openai-widgets", False):
+        for key in (
+            key_widget,
+            "settings-openai-model",
+            "settings-remove-openai-confirmed",
+        ):
+            st.session_state.pop(key, None)
     try:
         configured = load_openai_settings()
         configuration_error = ""
     except OpenAIConfigurationError as error:
         configured = None
         configuration_error = str(error)
+    except (OSError, UnicodeError) as error:
+        configured = None
+        configuration_error = f"The local OpenAI settings could not be read: {error}"
+
+    try:
+        rms_credentials = load_rms_credentials()
+        rms_configuration_error = ""
+    except WebsiteNotConfiguredError:
+        rms_credentials = None
+        rms_configuration_error = ""
+    except (OSError, UnicodeError) as error:
+        rms_credentials = None
+        rms_configuration_error = f"The local RMS settings could not be read: {error}"
 
     with st.sidebar:
         st.header("Settings")
+        if rms_credentials is None:
+            st.caption("RMS login is not configured.")
+        else:
+            st.success("RMS login is configured.")
+        if rms_configuration_error:
+            st.error(rms_configuration_error)
+        with st.expander("RMS login"):
+            st.caption("Saved only on this Windows user profile and never copied into case data.")
+            with st.form("rms-settings-form"):
+                rms_email = st.text_input(
+                    "RMS account email",
+                    value=rms_credentials.email if rms_credentials else "",
+                    key="settings-rms-email",
+                )
+                rms_password = st.text_input(
+                    "RMS account password",
+                    type="password",
+                    key="settings-rms-password",
+                    placeholder="Configured · enter a new password to replace it"
+                    if rms_credentials
+                    else "Password",
+                )
+                save_rms = st.form_submit_button(
+                    "Save RMS login",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if save_rms:
+                try:
+                    effective_password = rms_password or (
+                        rms_credentials.password if rms_credentials else ""
+                    )
+                    save_rms_credentials(rms_email, effective_password)
+                    st.session_state.pop("settings-rms-password", None)
+                    st.success("RMS login was saved locally.")
+                    st.rerun()
+                except (WebsiteNotConfiguredError, OSError) as error:
+                    st.error(str(error))
+            remove_rms_confirmed = st.checkbox(
+                "Remove the saved RMS login",
+                key="settings-remove-rms-confirmed",
+            )
+            if st.button(
+                "Remove RMS login",
+                type="tertiary",
+                use_container_width=True,
+                disabled=not remove_rms_confirmed,
+            ):
+                try:
+                    remove_rms_credentials()
+                    st.session_state["settings-reset-rms-widgets"] = True
+                    st.success("The saved RMS login was removed from this Windows profile.")
+                    st.rerun()
+                except OSError as error:
+                    st.error(str(error))
+
         if configured is None:
             st.caption("AI property extraction is not configured.")
         else:
@@ -144,8 +473,9 @@ def _render_openai_settings() -> None:
 
         with st.expander("OpenAI property extraction"):
             st.caption(
-                "Optional. Only notary-document OCR text is sent. ID data, files, contract "
-                "templates, and RMS data are not sent to OpenAI."
+                "Optional. Only notary-document OCR text is sent; that text may itself contain "
+                "names, identifiers, addresses, or other personal data from the deed. ID files, "
+                "separately extracted ID fields, contract templates, and RMS data are not added."
             )
             with st.form("openai-settings-form"):
                 api_key = st.text_input(
@@ -161,7 +491,11 @@ def _render_openai_settings() -> None:
                     value=configured.model if configured else DEFAULT_OPENAI_MODEL,
                     key="settings-openai-model",
                 )
-                save = st.form_submit_button("Test and save", use_container_width=True)
+                save = st.form_submit_button(
+                    "Test and save",
+                    type="primary",
+                    use_container_width=True,
+                )
 
             if save:
                 try:
@@ -169,24 +503,274 @@ def _render_openai_settings() -> None:
                     candidate = OpenAISettings(api_key=effective_key, model=model.strip())
                     verify_openai_settings(candidate)
                     save_openai_settings(candidate.api_key, candidate.model)
-                    st.session_state["settings-clear-openai-key"] = True
+                    st.session_state["settings-reset-openai-widgets"] = True
                     st.success("OpenAI settings were verified and saved locally.")
                     st.rerun()
-                except OpenAIConfigurationError as error:
+                except (OpenAIConfigurationError, OSError) as error:
                     st.error(str(error))
+            remove_openai_confirmed = st.checkbox(
+                "Remove the saved OpenAI credentials",
+                key="settings-remove-openai-confirmed",
+            )
+            if st.button(
+                "Remove OpenAI credentials",
+                type="tertiary",
+                use_container_width=True,
+                disabled=not remove_openai_confirmed,
+            ):
+                try:
+                    remove_openai_settings()
+                    st.session_state["settings-reset-openai-widgets"] = True
+                    st.success("The saved OpenAI credentials were removed from this Windows profile.")
+                    st.rerun()
+                except OSError as error:
+                    st.error(str(error))
+
+        rms_active = rms_worker_is_active(CASES_ROOT)
+        if is_frozen():
+            st.divider()
+            if st.button(
+                "Exit application",
+                type="tertiary",
+                use_container_width=True,
+                disabled=rms_active,
+            ):
+                from desktop_launcher import schedule_desktop_shutdown
+
+                schedule_desktop_shutdown()
+                st.success("The local application is closing. This tab can be closed.")
+                st.stop()
+        if rms_active:
+            if not is_frozen():
+                st.divider()
+            st.caption(
+                "Close the active RMS browser before exiting the packaged application or "
+                "starting another RMS case."
+            )
+            _render_rms_session_recovery(
+                CASES_ROOT,
+                key_prefix="settings",
+            )
 
 
 def _render_privacy_notice() -> None:
     st.info(
-        "Files are stored under the local `cases` directory. OCR runs locally. "
+        f"Files are stored locally under `{CASES_ROOT}`. OCR runs locally. "
         "Do not use real personal documents in development unless their use is authorized."
     )
 
 
-def _extract(front_name: str, front_content: bytes, back_name: str, back_content: bytes) -> None:
-    if _current_case_rms_worker_is_active():
-        st.error("Close the active RMS browser before starting another identity case.")
+def _render_case_manager() -> None:
+    """Offer minimal recovery and explicit deletion for file-backed local cases."""
+
+    try:
+        cases = list_local_cases(CASES_ROOT)
+        cleanup_residue = list_case_cleanup_residue(CASES_ROOT)
+    except ValueError as error:
+        st.warning(str(error))
         return
+    if cleanup_residue:
+        with st.expander("Private-file cleanup required", expanded=True):
+            st.warning(
+                f"{len(cleanup_residue)} interrupted case cleanup item(s) remain locally. "
+                "Their contents are not used by the application."
+            )
+            confirmed = st.checkbox(
+                "Retry permanent removal of interrupted case files",
+                key="confirm-retry-case-cleanup",
+            )
+            if st.button(
+                "Retry private-file cleanup",
+                type="tertiary",
+                use_container_width=True,
+                disabled=not confirmed,
+            ):
+                removed, failed = retry_case_cleanup(CASES_ROOT)
+                st.session_state["case-notice"] = (
+                    f"Removed {removed} interrupted cleanup item(s)."
+                    + (
+                        f" {failed} item(s) are still locked; close other tabs and retry."
+                        if failed
+                        else ""
+                    )
+                )
+                st.rerun()
+    if not cases:
+        return
+
+    by_id = {paths.case_id: paths for paths in cases}
+    with st.expander("Recent local cases"):
+        selected_id = st.selectbox(
+            "Saved case",
+            options=list(by_id),
+            format_func=lambda case_id: _local_case_label(by_id[case_id]),
+            key="saved-case-selection",
+        )
+        selected = by_id[selected_id]
+        can_open = selected.extracted_json.is_file()
+        selected_status = read_rms_status(selected.root)
+        selected_worker_active = rms_status_is_active(selected_status)
+
+        open_column, delete_column = st.columns(2)
+        with open_column:
+            if st.button(
+                "Open selected case",
+                use_container_width=True,
+                disabled=not can_open,
+                key=f"open-saved-case-{selected_id}",
+            ):
+                try:
+                    _load_local_case(selected)
+                    st.rerun()
+                except (OSError, ValueError) as error:
+                    st.error(f"The saved case could not be opened: {error}")
+            if not can_open:
+                st.caption("This incomplete case can be deleted but cannot be resumed.")
+
+        with delete_column:
+            confirmed = st.checkbox(
+                "Permanently delete this case and its documents",
+                key=f"confirm-delete-case-{selected_id}",
+            )
+            if st.button(
+                "Delete selected case",
+                type="tertiary",
+                use_container_width=True,
+                disabled=not confirmed or selected_worker_active,
+                key=f"delete-saved-case-{selected_id}",
+            ):
+                try:
+                    delete_local_case(
+                        selected,
+                        CASES_ROOT,
+                        blocked=lambda: rms_status_is_active(read_rms_status(selected.root)),
+                    )
+                    if st.session_state.get("case_root") == str(selected.root):
+                        _clear_loaded_case()
+                    st.session_state["case-notice"] = (
+                        "The selected local case and its documents were permanently deleted."
+                    )
+                    st.rerun()
+                except (OSError, ValueError) as error:
+                    st.error(f"The selected case could not be deleted: {error}")
+            if selected_worker_active:
+                st.caption("Close the RMS browser before deleting this case.")
+
+
+def _local_case_label(case_paths: CasePaths) -> str:
+    if not case_paths.extracted_json.is_file():
+        state = "incomplete"
+    elif not case_paths.final_json.is_file():
+        state = "extracted"
+    else:
+        try:
+            read_validated_identity_snapshot(
+                case_paths.final_json,
+                expected_case_id=case_paths.case_id,
+            )
+            state = "reviewed"
+        except ValueError:
+            state = "review required"
+    draft_count = len(_verified_generated_contracts(case_paths.root, case_paths.case_id)[0])
+    draft_label = f" · {draft_count} draft{'s' if draft_count != 1 else ''}" if draft_count else ""
+    return f"{case_paths.case_id} · {state}{draft_label}"
+
+
+def _load_local_case(case_paths: CasePaths) -> None:
+    with case_mutation_lock(case_paths, case_paths.root.parent):
+        extraction_payload = case_paths.extracted_json.read_bytes()
+        extraction = ExtractionResult.model_validate_json(extraction_payload)
+        if extraction.case_id != case_paths.case_id:
+            raise ValueError("The extraction record belongs to a different case.")
+        extraction_sha256 = hashlib.sha256(extraction_payload).hexdigest()
+
+        load_warnings: list[str] = []
+        approved_document: PersonalDocument | None = None
+        identity_snapshot_sha256: str | None = ""
+        if case_paths.final_json.is_file():
+            try:
+                identity_snapshot_sha256 = file_sha256(case_paths.final_json)
+                validated_identity = read_validated_identity_snapshot(
+                    case_paths.final_json,
+                    expected_case_id=case_paths.case_id,
+                )
+                approved_document = validated_identity.snapshot.document
+            except (OSError, ValueError):
+                if identity_snapshot_sha256 == "":
+                    identity_snapshot_sha256 = None
+                load_warnings.append(
+                    "The reviewed identity record is legacy, invalid, or no longer matches its OCR "
+                    "evidence; the original extraction was opened for review."
+                )
+
+        property_extraction: PropertyExtractionResult | None = None
+        property_record = case_paths.root / "property_extracted.json"
+        if property_record.is_file():
+            try:
+                property_extraction = PropertyExtractionResult.model_validate_json(
+                    property_record.read_bytes()
+                )
+                if property_extraction.case_id != case_paths.case_id:
+                    raise ValueError("case mismatch")
+            except (OSError, ValueError):
+                property_extraction = None
+                load_warnings.append(
+                    "The saved property extraction is invalid and was not restored. Extract the notary document again."
+                )
+
+        processed_pages = []
+        for side, directory_name in (("Front", "front"), ("Back", "back")):
+            directory = case_paths.processed / directory_name
+            processed_pages.extend(
+                {"side": side, "path": str(path)}
+                for path in sorted(directory.glob("*"))
+                if path.is_file() and path.suffix.casefold() in {".jpg", ".jpeg", ".png"}
+            )
+        property_pages = sorted(
+            path
+            for path in (case_paths.processed / "property").glob("*")
+            if path.is_file() and path.suffix.casefold() in {".jpg", ".jpeg", ".png"}
+        )
+
+    _clear_loaded_case()
+    st.session_state["case_root"] = str(case_paths.root)
+    st.session_state["processed_pages"] = processed_pages
+    st.session_state["extraction"] = extraction
+    st.session_state["extraction_case_id"] = case_paths.case_id
+    st.session_state["extraction_sha256"] = extraction_sha256
+    st.session_state["identity_snapshot_sha256"] = identity_snapshot_sha256
+    st.session_state["case_load_warnings"] = load_warnings
+    if approved_document is not None:
+        st.session_state["approved_document"] = approved_document
+        st.session_state["approved_case_id"] = case_paths.case_id
+    if property_extraction is not None:
+        st.session_state["property_extraction"] = property_extraction
+        st.session_state["property_case_id"] = case_paths.case_id
+        st.session_state["property_pages"] = [str(path) for path in property_pages]
+
+
+def _clear_loaded_case() -> None:
+    for key in (
+        "case_root",
+        "processed_pages",
+        "extraction",
+        "extraction_case_id",
+        "extraction_sha256",
+        "identity_snapshot_sha256",
+        "approved_document",
+        "approved_case_id",
+        "generated_contracts",
+        "property_extraction",
+        "property_case_id",
+        "property_pages",
+        "case_load_warnings",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _extract(front_name: str, front_content: bytes, back_name: str, back_content: bytes) -> None:
+    case_paths: CasePaths | None = None
+    extraction_committed = False
     try:
         with st.status("Processing document…", expanded=True) as status:
             st.write("Creating a local case")
@@ -195,40 +779,43 @@ def _extract(front_name: str, front_content: bytes, back_name: str, back_content
                 front_content,
                 storage_stem="front",
             )
-            back_path = save_original(
-                case_paths,
-                back_name,
-                back_content,
-                storage_stem="back",
-            )
-            st.write("Rendering and enhancing the front side")
-            front_pages = prepare_document(front_path, case_paths.processed / "front")
-            st.write("Rendering and enhancing the back side")
-            back_pages = prepare_document(back_path, case_paths.processed / "back")
-            pages = front_pages + back_pages
-            st.write("Loading local OCR models and recognizing text")
-            ocr_lines = get_ocr_engine().recognize(pages)
-            st.write("Mapping recognized text to document fields")
-            document, warnings = parse_bulgarian_identity_document(ocr_lines)
-            address_ocr_lines = []
-            if address_needs_upright_retry(document.address):
-                st.write("Retrying the small address text in an upright orientation")
-                for index, back_page in enumerate(back_pages, start=len(front_pages) + 1):
-                    address_ocr_lines.extend(
-                        get_ocr_engine().recognize_upright_retry(back_page, index)
-                    )
-                document, warnings = parse_bulgarian_identity_document(
-                    ocr_lines,
-                    address_lines=address_ocr_lines,
+            with case_mutation_lock(case_paths, case_paths.root.parent):
+                back_path = save_original(
+                    case_paths,
+                    back_name,
+                    back_content,
+                    storage_stem="back",
                 )
-            extraction = ExtractionResult(
-                case_id=case_paths.case_id,
-                document=document,
-                ocr_lines=ocr_lines,
-                address_ocr_lines=address_ocr_lines,
-                warnings=warnings,
-            )
-            write_json(case_paths.extracted_json, extraction.model_dump(mode="json"))
+                st.write("Rendering and enhancing the front side")
+                front_pages = prepare_document(front_path, case_paths.processed / "front")
+                st.write("Rendering and enhancing the back side")
+                back_pages = prepare_document(back_path, case_paths.processed / "back")
+                pages = front_pages + back_pages
+                st.write("Loading local OCR models and recognizing text")
+                ocr_lines = get_ocr_engine().recognize(pages)
+                st.write("Mapping recognized text to document fields")
+                document, warnings = parse_bulgarian_identity_document(ocr_lines)
+                address_ocr_lines = []
+                if address_needs_upright_retry(document.address):
+                    st.write("Retrying the small address text in an upright orientation")
+                    for index, back_page in enumerate(back_pages, start=len(front_pages) + 1):
+                        address_ocr_lines.extend(
+                            get_ocr_engine().recognize_upright_retry(back_page, index)
+                        )
+                    document, warnings = parse_bulgarian_identity_document(
+                        ocr_lines,
+                        address_lines=address_ocr_lines,
+                    )
+                extraction = ExtractionResult(
+                    case_id=case_paths.case_id,
+                    document=document,
+                    ocr_lines=ocr_lines,
+                    address_ocr_lines=address_ocr_lines,
+                    warnings=warnings,
+                )
+                write_json(case_paths.extracted_json, extraction.model_dump(mode="json"))
+                extraction_sha256 = file_sha256(case_paths.extracted_json)
+                extraction_committed = True
 
             st.session_state["case_root"] = str(case_paths.root)
             st.session_state["processed_pages"] = [
@@ -237,6 +824,9 @@ def _extract(front_name: str, front_content: bytes, back_name: str, back_content
                 {"side": "Back", "path": str(page)} for page in back_pages
             ]
             st.session_state["extraction"] = extraction
+            st.session_state["extraction_case_id"] = case_paths.case_id
+            st.session_state["extraction_sha256"] = extraction_sha256
+            st.session_state["identity_snapshot_sha256"] = ""
             st.session_state.pop("approved_document", None)
             st.session_state.pop("approved_case_id", None)
             st.session_state.pop("generated_contracts", None)
@@ -245,17 +835,44 @@ def _extract(front_name: str, front_content: bytes, back_name: str, back_content
             st.session_state.pop("property_pages", None)
             status.update(label="Extraction complete", state="complete", expanded=False)
     except (ValueError, DocumentProcessingError, OcrUnavailableError) as error:
-        st.error(str(error))
+        cleanup_note = _discard_failed_identity_case(case_paths, extraction_committed)
+        st.error(f"{error}{cleanup_note}")
     except Exception as error:
+        cleanup_note = _discard_failed_identity_case(case_paths, extraction_committed)
         st.error(
             "Document extraction failed. No data was submitted anywhere. "
-            f"Technical detail: {error}"
+            f"Technical detail: {error}{cleanup_note}"
         )
+
+
+def _discard_failed_identity_case(
+    case_paths: CasePaths | None,
+    extraction_committed: bool,
+) -> str:
+    if case_paths is None or extraction_committed:
+        return ""
+    try:
+        delete_local_case(case_paths, case_paths.root.parent)
+    except (OSError, ValueError):
+        return " The incomplete local case could not be removed; delete it under Recent local cases."
+    return " Temporary local files from this failed attempt were removed."
 
 
 def _render_case(extraction: ExtractionResult) -> None:
     st.divider()
     st.subheader(f"Case {extraction.case_id}")
+    expected_extraction_sha256 = (
+        str(st.session_state.get("extraction_sha256", ""))
+        if st.session_state.get("extraction_case_id") == extraction.case_id
+        else ""
+    )
+    expected_identity_snapshot_sha256 = (
+        st.session_state.get("identity_snapshot_sha256")
+        if st.session_state.get("extraction_case_id") == extraction.case_id
+        else None
+    )
+    for warning in st.session_state.get("case_load_warnings", []):
+        st.warning(warning)
 
     approved_for_case = st.session_state.get("approved_case_id") == extraction.case_id
     approved_document = st.session_state.get("approved_document") if approved_for_case else None
@@ -275,7 +892,12 @@ def _render_case(extraction: ExtractionResult) -> None:
                 use_container_width=True,
             ):
                 _reparse_identity_extraction(extraction)
-            _review_form(extraction.case_id, extraction.document)
+            _review_form(
+                extraction.case_id,
+                extraction.document,
+                expected_extraction_sha256,
+                expected_identity_snapshot_sha256,
+            )
         return
 
     st.success("The identity snapshot is ready for the selected local POC operation.")
@@ -294,7 +916,12 @@ def _render_case(extraction: ExtractionResult) -> None:
             st.session_state[editing_key] = False
             st.rerun()
         else:
-            _review_form(extraction.case_id, approved_document)
+            _review_form(
+                extraction.case_id,
+                approved_document,
+                expected_extraction_sha256,
+                expected_identity_snapshot_sha256,
+            )
     else:
         if rms_worker_active:
             st.caption("Close the active RMS browser before editing this identity snapshot.")
@@ -416,7 +1043,12 @@ def _render_operation_hub(case_id: str, client: PersonalDocument) -> None:
         _render_rms_workflow(case_id, client)
 
 
-def _review_form(case_id: str, initial: PersonalDocument) -> None:
+def _review_form(
+    case_id: str,
+    initial: PersonalDocument,
+    expected_extraction_sha256: str,
+    expected_identity_snapshot_sha256: str | None,
+) -> None:
     key_prefix = f"review-{case_id}"
     with st.form(f"document-review-{case_id}"):
         first_column, second_column = st.columns(2)
@@ -488,19 +1120,71 @@ def _review_form(case_id: str, initial: PersonalDocument) -> None:
         for issue in issues:
             st.error(f"{_field_label(issue.field)}: {issue.message}")
         return
-    case_root = Path(st.session_state["case_root"])
-    if rms_status_is_active(read_rms_status(case_root)):
-        st.error(
-            "Close the active RMS browser before saving identity changes; "
-            "the open browser holds the previous snapshot."
+    try:
+        saved_snapshot_sha256 = _persist_approved_identity(
+            case_id,
+            document,
+            expected_extraction_sha256,
+            expected_identity_snapshot_sha256,
         )
+    except (OSError, ValueError) as error:
+        st.error(str(error))
         return
-    write_json(case_root / "final.json", document.model_dump(mode="json"))
     st.session_state["approved_document"] = document
     st.session_state["approved_case_id"] = case_id
+    st.session_state["identity_snapshot_sha256"] = saved_snapshot_sha256
+    st.session_state.pop("case_load_warnings", None)
     st.session_state[f"editing-approved-identity-{case_id}"] = False
     st.session_state[f"selected-operation-{case_id}"] = None
     st.rerun()
+
+
+def _persist_approved_identity(
+    case_id: str,
+    document: PersonalDocument,
+    expected_extraction_sha256: str,
+    expected_identity_snapshot_sha256: str | None,
+) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_extraction_sha256):
+        raise ValueError("The reviewed OCR evidence version is unavailable. Reload the case and try again.")
+    if expected_identity_snapshot_sha256 is None or (
+        expected_identity_snapshot_sha256
+        and not re.fullmatch(r"[0-9a-f]{64}", expected_identity_snapshot_sha256)
+    ):
+        raise ValueError("The reviewed identity version is unavailable. Reload the case and try again.")
+    case_paths = existing_case_paths(Path(st.session_state["case_root"]), case_id)
+    with case_mutation_lock(case_paths, case_paths.root.parent):
+        if rms_status_is_active(read_rms_status(case_paths.root)):
+            raise ValueError(
+                "Close the active RMS browser before saving identity changes; "
+                "the open browser holds the previous snapshot."
+            )
+        extraction_payload = case_paths.extracted_json.read_bytes()
+        saved_extraction = ExtractionResult.model_validate_json(extraction_payload)
+        if saved_extraction.case_id != case_id:
+            raise ValueError("The OCR extraction belongs to a different case.")
+        current_extraction_sha256 = hashlib.sha256(extraction_payload).hexdigest()
+        if current_extraction_sha256 != expected_extraction_sha256:
+            raise ValueError(
+                "The OCR extraction changed while this review was open. Reload the case and review it again."
+            )
+        if case_paths.final_json.exists() and not case_paths.final_json.is_file():
+            raise ValueError("The reviewed identity record is not a regular file.")
+        current_identity_snapshot_sha256 = (
+            file_sha256(case_paths.final_json) if case_paths.final_json.is_file() else ""
+        )
+        if current_identity_snapshot_sha256 != expected_identity_snapshot_sha256:
+            raise ValueError(
+                "The reviewed identity changed while this form was open. Reload the case and review it again."
+            )
+        snapshot = ApprovedIdentitySnapshot(
+            case_id=case_id,
+            extracted_sha256=current_extraction_sha256,
+            document=document,
+            approved_at=datetime.now().astimezone(),
+        )
+        write_json(case_paths.final_json, snapshot.model_dump(mode="json"))
+        return file_sha256(case_paths.final_json)
 
 
 def _reparse_identity_extraction(extraction: ExtractionResult) -> None:
@@ -510,29 +1194,38 @@ def _reparse_identity_extraction(extraction: ExtractionResult) -> None:
         Path(st.session_state["case_root"]),
         extraction.case_id,
     )
-    if rms_status_is_active(read_rms_status(case_paths.root)):
-        st.error(
-            "Close the active RMS browser before re-categorizing identity data; "
-            "the open browser still holds the previous snapshot."
-        )
-        return
+    try:
+        with case_mutation_lock(case_paths, case_paths.root.parent):
+            if rms_status_is_active(read_rms_status(case_paths.root)):
+                st.error(
+                    "Close the active RMS browser before re-categorizing identity data; "
+                    "the open browser still holds the previous snapshot."
+                )
+                return
 
-    document, warnings = parse_bulgarian_identity_document(
-        extraction.ocr_lines,
-        address_lines=extraction.address_ocr_lines,
-    )
-    refreshed = ExtractionResult(
-        case_id=extraction.case_id,
-        document=document,
-        ocr_lines=extraction.ocr_lines,
-        address_ocr_lines=extraction.address_ocr_lines,
-        warnings=warnings,
-    )
-    write_json(case_paths.extracted_json, refreshed.model_dump(mode="json"))
-    # The saved snapshot was derived from the previous categorization and must not
-    # remain launchable after the evidence has been reparsed.
-    case_paths.final_json.unlink(missing_ok=True)
+            document, warnings = parse_bulgarian_identity_document(
+                extraction.ocr_lines,
+                address_lines=extraction.address_ocr_lines,
+            )
+            refreshed = ExtractionResult(
+                case_id=extraction.case_id,
+                document=document,
+                ocr_lines=extraction.ocr_lines,
+                address_ocr_lines=extraction.address_ocr_lines,
+                warnings=warnings,
+            )
+            write_json(case_paths.extracted_json, refreshed.model_dump(mode="json"))
+            refreshed_sha256 = file_sha256(case_paths.extracted_json)
+            # The saved snapshot was derived from the previous categorization and must not
+            # remain launchable after the evidence has been reparsed.
+            case_paths.final_json.unlink(missing_ok=True)
+    except (OSError, ValueError) as error:
+        st.error(str(error))
+        return
     st.session_state["extraction"] = refreshed
+    st.session_state["extraction_case_id"] = extraction.case_id
+    st.session_state["extraction_sha256"] = refreshed_sha256
+    st.session_state["identity_snapshot_sha256"] = ""
     if st.session_state.get("approved_case_id") == extraction.case_id:
         st.session_state.pop("approved_document", None)
         st.session_state.pop("approved_case_id", None)
@@ -782,20 +1475,13 @@ def _render_contract_workflow(case_id: str, client: PersonalDocument) -> None:
                 warnings_acknowledged=False,
             )
             with st.spinner("Generating and validating the contract draft…"):
-                generated = generate_contract(contract_input, case_root)
-            generated_contracts = st.session_state.setdefault("generated_contracts", [])
-            generated_contracts.append(
-                {
-                    "case_id": case_id,
-                    "role": role.value,
-                    "path": str(generated.document_path),
-                    "manifest_path": str(generated.manifest_path),
-                }
-            )
+                case_paths = existing_case_paths(case_root, case_id)
+                with case_mutation_lock(case_paths, case_paths.root.parent):
+                    generate_contract(contract_input, case_root)
             st.success("The contract draft was generated locally and validated.")
         except ValidationError as error:
             _show_contract_validation_errors(error)
-        except (ContractGenerationError, OSError) as error:
+        except (ContractGenerationError, OSError, ValueError) as error:
             st.error(str(error))
 
     _render_generated_contracts(case_id)
@@ -808,7 +1494,7 @@ def _render_seller_property_assistance(
     st.markdown("##### Notary document OCR assistance")
     try:
         openai_settings = load_openai_settings()
-    except OpenAIConfigurationError as error:
+    except (OpenAIConfigurationError, OSError, UnicodeError) as error:
         openai_settings = None
         st.warning(str(error))
 
@@ -860,6 +1546,7 @@ def _render_seller_property_assistance(
     )
     if st.button(
         "Extract property details",
+        type="primary",
         disabled=(
             property_upload is None
             or oversized
@@ -971,6 +1658,39 @@ def _render_seller_property_assistance(
 
 
 def _extract_property_document(
+    case_id: str,
+    seller: PersonalDocument,
+    original_name: str,
+    content: bytes,
+    extraction_method: PropertyExtractionMethod,
+    external_processing_authorized: bool = False,
+) -> None:
+    try:
+        case_paths = existing_case_paths(Path(st.session_state["case_root"]), case_id)
+        with case_mutation_lock(case_paths, case_paths.root.parent):
+            validated_identity = read_validated_identity_snapshot(
+                case_paths.final_json,
+                expected_case_id=case_id,
+            )
+            if personal_document_fingerprint(
+                validated_identity.snapshot.document
+            ) != personal_document_fingerprint(seller):
+                raise ValueError(
+                    "The reviewed seller identity changed in another tab. Reload the case and try again."
+                )
+            _extract_property_document_locked(
+                case_id,
+                seller,
+                original_name,
+                content,
+                extraction_method,
+                external_processing_authorized,
+            )
+    except (OSError, ValueError) as error:
+        st.error(str(error))
+
+
+def _extract_property_document_locked(
     case_id: str,
     seller: PersonalDocument,
     original_name: str,
@@ -1187,10 +1907,31 @@ def _refresh_property_seller_comparison(
         external_processing_authorized_at=extraction.external_processing_authorized_at,
     )
     case_paths = existing_case_paths(Path(st.session_state["case_root"]), case_id)
-    write_json(
-        case_paths.root / "property_extracted.json",
-        refreshed.model_dump(mode="json"),
-    )
+    try:
+        with case_mutation_lock(case_paths, case_paths.root.parent):
+            validated_identity = read_validated_identity_snapshot(
+                case_paths.final_json,
+                expected_case_id=case_id,
+            )
+            if personal_document_fingerprint(
+                validated_identity.snapshot.document
+            ) != seller_fingerprint:
+                raise ValueError(
+                    "The reviewed seller identity changed in another tab. Reload the case and try again."
+                )
+            record_path = case_paths.root / "property_extracted.json"
+            if record_path.is_file():
+                current = PropertyExtractionResult.model_validate_json(record_path.read_bytes())
+                if current != extraction:
+                    st.warning(
+                        "The property extraction changed in another tab. The newer saved values were kept."
+                    )
+                    st.session_state["property_extraction"] = current
+                    return current
+            write_json(record_path, refreshed.model_dump(mode="json"))
+    except (OSError, ValueError) as error:
+        st.warning(str(error))
+        return extraction
     st.session_state["property_extraction"] = refreshed
     return refreshed
 
@@ -1203,28 +1944,95 @@ def _show_contract_validation_errors(error: ValidationError) -> None:
 
 
 def _render_generated_contracts(case_id: str) -> None:
-    generated_contracts = [
-        item
-        for item in st.session_state.get("generated_contracts", [])
-        if item.get("case_id") == case_id
-    ]
+    case_root = Path(st.session_state["case_root"]).resolve()
+    generated_contracts, invalid_count = _verified_generated_contracts(case_root, case_id)
+    if invalid_count:
+        st.warning(
+            f"{invalid_count} stored contract draft bundle(s) failed integrity validation and "
+            "were not offered for download."
+        )
     if not generated_contracts:
         return
 
-    st.markdown("##### Generated drafts")
-    for index, item in enumerate(reversed(generated_contracts), start=1):
-        document_path = Path(item["path"])
-        if not document_path.is_file():
-            continue
-        role_label = item["role"].title()
+    current = [draft for draft in generated_contracts if draft[2]]
+    historical = [draft for draft in generated_contracts if not draft[2]]
+    if current:
+        st.markdown("##### Current drafts")
+        _render_contract_downloads(case_id, current, historical=False)
+    if historical:
+        with st.expander(f"Historical drafts · {len(historical)}", expanded=not current):
+            st.warning(
+                "These intact drafts were generated from an older identity or property source. "
+                "Keep them only as case history; generate a new draft for the current case data."
+            )
+            _render_contract_downloads(case_id, historical, historical=True)
+
+
+def _render_contract_downloads(
+    case_id: str,
+    drafts: list[tuple[ContractManifest, Path, bool]],
+    *,
+    historical: bool,
+) -> None:
+    for index, (manifest, document_path, _) in enumerate(drafts, start=1):
+        role_label = manifest.role.value.title()
+        state_label = "historical " if historical else ""
         st.download_button(
-            f"Download {role_label} contract draft · {document_path.name}",
+            f"Download {state_label}{role_label} contract draft · {document_path.name}",
             data=document_path.read_bytes(),
             file_name=document_path.name,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            key=f"download-contract-{case_id}-{index}-{document_path.name}",
+            key=(
+                f"download-contract-{case_id}-{'historical' if historical else 'current'}-"
+                f"{index}-{document_path.name}"
+            ),
             use_container_width=True,
         )
+
+
+def _verified_generated_contracts(
+    case_root: Path,
+    case_id: str,
+) -> tuple[list[tuple[ContractManifest, Path, bool]], int]:
+    """Rebuild downloadable drafts from intact, case-bound manifest bundles."""
+
+    output_directory = (case_root / "output").resolve()
+    verified: list[tuple[ContractManifest, Path, bool]] = []
+    invalid_count = 0
+    for manifest_path in sorted(case_root.glob("contract-manifest-*.json"), reverse=True):
+        try:
+            manifest = ContractManifest.model_validate_json(manifest_path.read_bytes())
+            if manifest.case_id != case_id or case_root.name != case_id:
+                raise ValueError("case mismatch")
+            if Path(manifest.output_filename).name != manifest.output_filename:
+                raise ValueError("invalid output filename")
+            if Path(manifest.input_filename).name != manifest.input_filename:
+                raise ValueError("invalid input filename")
+            document_path = (output_directory / manifest.output_filename).resolve()
+            input_path = (case_root / manifest.input_filename).resolve()
+            if document_path.parent != output_directory or input_path.parent != case_root:
+                raise ValueError("artifact outside case")
+            if not document_path.is_file() or not input_path.is_file():
+                raise ValueError("artifact missing")
+            if file_sha256(document_path) != manifest.output_sha256:
+                raise ValueError("output hash mismatch")
+            if file_sha256(input_path) != manifest.input_sha256:
+                raise ValueError("input hash mismatch")
+            contract_input = ContractInput.model_validate_json(input_path.read_bytes())
+            if contract_input.case_id != case_id or contract_input.role is not manifest.role:
+                raise ValueError("input metadata mismatch")
+        except (OSError, ValueError):
+            invalid_count += 1
+            continue
+        verified.append(
+            (
+                manifest,
+                document_path,
+                contract_input_matches_active_sources(contract_input, case_root),
+            )
+        )
+    verified.sort(key=lambda item: item[0].generated_at, reverse=True)
+    return verified, invalid_count
 
 
 def _render_rms_workflow(case_id: str, client: PersonalDocument) -> None:
@@ -1236,8 +2044,10 @@ def _render_rms_workflow(case_id: str, client: PersonalDocument) -> None:
     )
     st.warning(
         "This action sends the reviewed identity details to rms.bg. The visible browser fills "
-        "the initial identity, identification-document, and permanent-address pages. It does "
-        "not continue to contact or risk questions and does not submit an assessment."
+        "the identity, identification-document, permanent-address, contact, and representative "
+        "pages, then confirms and submits the assessment. RMS may deduct one available "
+        "assessment when the incomplete-data warning is accepted. Keep the browser open to "
+        "review the result."
     )
     rms_values = identity_field_values(client)
     rms_field_labels = {
@@ -1302,11 +2112,19 @@ def _render_rms_workflow(case_id: str, client: PersonalDocument) -> None:
     state = status.get("state") if status else None
     pid = status.get("pid") if status else None
     worker_active = rms_status_is_active(status)
+    global_worker_active = rms_worker_is_active(case_root.parent)
+    submission_already_attempted = bool(
+        status
+        and (
+            status.get("submission_attempted") is True
+            or status.get("submission_confirmed") is True
+        )
+    )
     if status:
         message = str(status.get("message", "RMS status is unavailable."))
         if state == "error":
             st.error(message)
-        elif state == "filled":
+        elif state in {"filled", "submitted", "completed"}:
             st.success(message)
             filled_fields = status.get("filled_fields", [])
             unmatched_fields = status.get("unmatched_fields", [])
@@ -1329,30 +2147,104 @@ def _render_rms_workflow(case_id: str, client: PersonalDocument) -> None:
         if state in ACTIVE_STATES and isinstance(pid, int) and not worker_active:
             st.warning("The previous RMS worker is no longer running. You may start a new session.")
 
+        try:
+            rms_pdf_path = validated_rms_pdf_path(case_root, status)
+        except WebsiteAutomationError as error:
+            st.warning(str(error))
+        else:
+            if rms_pdf_path is not None:
+                try:
+                    rms_pdf_data = rms_pdf_path.read_bytes()
+                except OSError as error:
+                    st.warning(f"The saved RMS PDF could not be read: {error}")
+                else:
+                    st.success(
+                        "The verified RMS PDF is ready. Open it directly or save a copy "
+                        "through this application."
+                    )
+                    open_column, download_column = st.columns(2)
+                    with open_column:
+                        if st.button(
+                            "Open RMS assessment PDF",
+                            type="secondary",
+                            use_container_width=True,
+                            key=(
+                                f"open-rms-pdf-{case_id}-"
+                                f"{status.get('rms_pdf_sha256', '')}"
+                            ),
+                        ):
+                            try:
+                                _open_local_pdf(rms_pdf_path)
+                            except OSError as error:
+                                st.error(f"The PDF could not be opened: {error}")
+                    with download_column:
+                        st.download_button(
+                            "Save a copy of the RMS assessment PDF",
+                            data=rms_pdf_data,
+                            file_name="RMS-assessment.pdf",
+                            mime="application/pdf",
+                            type="primary",
+                            use_container_width=True,
+                            on_click="ignore",
+                            key=(
+                                f"download-rms-pdf-{case_id}-"
+                                f"{status.get('rms_pdf_sha256', '')}"
+                            ),
+                        )
+                    st.caption(
+                        "Use these controls instead of the download item in the automated "
+                        "RMS browser; that browser uses temporary automation storage."
+                    )
+
     launch = st.button(
-        "Open RMS and fill client details",
+        "Open RMS and submit client assessment",
         type="primary",
         use_container_width=True,
-        disabled=worker_active or bool(readiness_issues),
+        disabled=(
+            global_worker_active
+            or submission_already_attempted
+            or bool(readiness_issues)
+        ),
         key=f"launch-rms-{case_id}",
     )
+    if global_worker_active:
+        if worker_active:
+            st.caption(
+                "An RMS browser session for this case is still active. Close its browser window "
+                "normally, or end it here if the window is gone or the session is stuck."
+            )
+        else:
+            st.warning(
+                "Another identity case currently owns the single RMS browser session. End that "
+                "session before opening RMS for this case."
+            )
+        _render_rms_session_recovery(
+            case_root.parent,
+            key_prefix=f"workflow-{case_id}",
+        )
+    if submission_already_attempted and not worker_active:
+        st.caption(
+            "RMS submission was already attempted for this case. Start a new identity case "
+            "instead of risking a duplicate assessment."
+        )
     if launch:
         try:
             case_paths = existing_case_paths(case_root, case_id)
-            started = launch_rms_automation(
-                case_paths.final_json,
-                case_paths.root,
-                client,
-            )
+            with case_mutation_lock(case_paths, case_paths.root.parent):
+                started = launch_rms_automation(
+                    case_paths.final_json,
+                    case_paths.root,
+                    client,
+                )
             st.session_state[f"rms-worker-pid-{case_id}"] = started.pid
             st.success(
-                "The visible RMS browser is starting. Keep it open, review every filled value, "
-                "and continue manually after the address page."
+                "The visible RMS browser is starting. It will complete and submit the supported "
+                "pages once, then keep the RMS result open for your review."
             )
         except (WebsiteAutomationError, ValueError, OSError) as error:
             st.error(str(error))
 
-    if status and state in ACTIVE_STATES:
+    if (status and state in ACTIVE_STATES) or global_worker_active:
         st.button(
             "Refresh RMS status",
             use_container_width=True,
@@ -1360,21 +2252,70 @@ def _render_rms_workflow(case_id: str, client: PersonalDocument) -> None:
         )
 
 
+def _render_rms_session_recovery(cases_root: Path, *, key_prefix: str) -> None:
+    """Offer graceful RMS shutdown first, then an explicit verified force-close."""
+
+    pending = rms_stop_request_is_pending(cases_root)
+    if not pending and st.button(
+        "Close active RMS browser session",
+        type="secondary",
+        use_container_width=True,
+        key=f"request-stop-rms-{key_prefix}",
+        help=(
+            "Use this after reviewing or downloading the result, or when the RMS browser "
+            "window has disappeared."
+        ),
+    ):
+        try:
+            pending = request_rms_automation_stop(cases_root)
+        except OSError as error:
+            st.error(f"The RMS session could not be asked to close: {error}")
+        else:
+            if pending:
+                st.info(
+                    "A clean close was requested. Wait a moment and refresh. If the verified "
+                    "worker remains stuck, use the force-close control below."
+                )
+            else:
+                st.info("The RMS session had already ended. Refresh the page and try again.")
+
+    if not pending:
+        return
+    st.warning(
+        "Force-close interrupts the active RMS worker and all of its browser child processes. "
+        "Use it only if the normal close request did not work."
+    )
+    if st.button(
+        "Force-close stuck RMS session",
+        type="tertiary",
+        use_container_width=True,
+        key=f"force-stop-rms-{key_prefix}",
+    ):
+        try:
+            closed = force_close_rms_automation(cases_root)
+        except (WebsiteAutomationError, OSError) as error:
+            st.error(str(error))
+        else:
+            if closed:
+                st.success(
+                    "The verified RMS worker and its browser processes were force-closed. "
+                    "Refresh to start another session."
+                )
+            else:
+                st.info("The RMS session had already ended.")
+
+
 def _normalized_or_original(value: str) -> str:
     normalized = normalize_date(value)
     return value.strip() if normalized is None else normalized
 
 
-def _current_case_rms_worker_is_active() -> bool:
-    """Prevent any UI session from replacing a live detached RMS case."""
+def _open_local_pdf(path: Path) -> None:
+    """Open one already-validated local PDF with the Windows default application."""
 
-    case_root = st.session_state.get("case_root")
-    cases_root = (
-        Path(str(case_root)).resolve().parent
-        if case_root
-        else Path(__file__).resolve().parent / "cases"
-    )
-    return rms_worker_is_active(cases_root)
+    if os.name != "nt" or not hasattr(os, "startfile"):
+        raise OSError("Direct opening is available in the Windows desktop application.")
+    os.startfile(path, "open")  # type: ignore[attr-defined]
 
 
 def _field_label(field: str) -> str:

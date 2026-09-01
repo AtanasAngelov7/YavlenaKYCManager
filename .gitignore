@@ -7,8 +7,17 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.packaging-venv*/
+.installer-smoke/
+.package-smoke-debug/
 venv/
 .local/
+build/
+dist/
+packaging/playwright-browsers/
+startup.log
+desktop-instance.lock
+desktop-status.json
 
 # Local application data (may contain personal data)
 cases/*

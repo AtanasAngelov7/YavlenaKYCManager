@@ -31,7 +31,7 @@ Template rules:
 
 1. Do not add real personal data to a controlled template.
 2. Do not render a template from raw OCR values.
-3. Render only from an approved, versioned contract-input JSON snapshot.
+3. Render only from a validated, versioned contract-input JSON snapshot. The local POC records approval fields as false; it must not invent approval.
 4. Write output only to the active case's `output` directory.
 5. Reject output containing unresolved template tags.
 6. Reject a template that does not match its approved hash and exact field inventory.

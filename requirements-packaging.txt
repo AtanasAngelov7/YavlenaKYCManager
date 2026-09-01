@@ -1,0 +1,2 @@
+# Convenience alias for the exact Windows release-build environment.
+-r requirements-packaging.lock.txt

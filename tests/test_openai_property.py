@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from dotenv import dotenv_values
 
 from models import BoundingBox, OcrLine, PersonalDocument, PropertyDocumentType
 from openai_property import (
@@ -15,6 +16,7 @@ from openai_property import (
     OpenAISettings,
     extract_property_details_with_openai,
     load_openai_settings,
+    remove_openai_settings,
     save_openai_settings,
     verify_openai_settings,
 )
@@ -115,12 +117,35 @@ def test_openai_settings_preserve_other_local_credentials(
     saved = save_openai_settings(api_key, "gpt-test-model", env_path)
     loaded = load_openai_settings(env_path)
     contents = env_path.read_text(encoding="utf-8")
+    values = dotenv_values(env_path, interpolate=False)
 
     assert saved == loaded
     assert "RMS_EMAIL=operator@example.test" in contents
     assert "RMS_PASSWORD=synthetic-rms-secret" in contents
-    assert "OPENAI_MODEL=gpt-test-model" in contents
+    assert values["OPENAI_MODEL"] == "gpt-test-model"
     assert api_key not in repr(saved)
+
+
+def test_openai_settings_can_be_removed_without_erasing_rms_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "OPENAI_API_KEY=sk-test-12345678901234567890\n"
+        "OPENAI_MODEL=gpt-test\n"
+        "RMS_EMAIL=operator@example.test\n",
+        encoding="utf-8",
+    )
+
+    remove_openai_settings(env_path)
+
+    values = dotenv_values(env_path, interpolate=False)
+    assert "OPENAI_API_KEY" not in values
+    assert "OPENAI_MODEL" not in values
+    assert values["RMS_EMAIL"] == "operator@example.test"
 
 
 def test_connection_check_sends_no_document_data() -> None:

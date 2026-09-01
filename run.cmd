@@ -12,7 +12,7 @@ if not exist "%PROJECT_PYTHON%" (
 )
 
 cd /d "%PROJECT_DIR%"
-"%PROJECT_PYTHON%" -m streamlit run streamlit_app.py --server.headless true --browser.gatherUsageStats false
+"%PROJECT_PYTHON%" desktop_launcher.py
 
 if errorlevel 1 (
     echo.

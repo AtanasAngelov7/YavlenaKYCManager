@@ -4,60 +4,51 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
 import cv2
 
 from models import BoundingBox, OcrLine
+from runtime_paths import is_frozen, prepare_ocr_cache
 
 
 class OcrUnavailableError(RuntimeError):
     pass
 
 
+_OCR_INITIALIZATION_LOCK = threading.Lock()
+
+
 class PaddleOcrEngine:
     """Small adapter around PaddleOCR's general OCR pipeline."""
 
     def __init__(self) -> None:
+        # Streamlit caches this adapter across sessions. Serialize Paddle's
+        # stateful pipeline even when different cases run from separate tabs.
+        self._inference_lock = threading.RLock()
         # Keep downloaded models and PaddleX temporary files inside this local
         # project instead of scattering them through the user's profile.
-        cache_directory = Path(".local") / "paddlex"
-        cache_directory.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_directory.resolve()))
+        cache_directory = prepare_ocr_cache()
+        if is_frozen():
+            os.environ["PADDLE_PDX_CACHE_HOME"] = str(cache_directory.resolve())
+        else:
+            os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_directory.resolve()))
         # PaddlePaddle 3.3's Windows CPU oneDNN path cannot execute the array
         # attribute used by the selected detection model. The regular CPU
         # inference path is slightly slower but reliable for this local app.
-        os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
+        os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "False"
 
-        try:
-            from paddleocr import PaddleOCR
-        except ImportError as error:
-            raise OcrUnavailableError(
-                "PaddleOCR is not installed. Install the project requirements first."
-            ) from error
-
-        # Mobile detection is a better CPU/local default than the much slower
-        # server detector. The Cyrillic model includes Bulgarian and English.
-        # Model files are downloaded on first use and then used locally.
-        self._pipeline = PaddleOCR(
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="cyrillic_PP-OCRv5_mobile_rec",
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            text_det_limit_side_len=2400,
-            text_det_limit_type="max",
-            device="cpu",
-        )
-
+        self._pipeline = _create_paddle_pipeline()
     def recognize(self, pages: Iterable[Path]) -> list[OcrLine]:
-        lines: list[OcrLine] = []
-        for page_number, page_path in enumerate(pages, start=1):
-            results = self._pipeline.predict(str(page_path))
-            for result in results:
-                lines.extend(_normalize_result(result, page_number))
-        return sorted(lines, key=lambda line: (line.page, line.box.top, line.box.left))
+        with self._inference_lock:
+            lines: list[OcrLine] = []
+            for page_number, page_path in enumerate(pages, start=1):
+                results = self._pipeline.predict(str(page_path))
+                for result in results:
+                    lines.extend(_normalize_result(result, page_number))
+            return sorted(lines, key=lambda line: (line.page, line.box.top, line.box.left))
 
     def recognize_top_region(
         self,
@@ -69,21 +60,32 @@ class PaddleOcrEngine:
 
         if not 0.2 <= fraction <= 0.8:
             raise ValueError("The OCR crop fraction must be between 0.2 and 0.8.")
-        image = cv2.imread(str(page_path), cv2.IMREAD_COLOR)
-        if image is None:
-            raise OcrUnavailableError(f"Could not read OCR page: {page_path.name}")
-        crop_bottom = float(round(image.shape[0] * fraction))
-        cropped = image[: int(crop_bottom), :]
-        lines: list[OcrLine] = []
-        for result in self._pipeline.predict(cropped):
-            lines.extend(_normalize_result(result, page_number))
-        return (
-            sorted(lines, key=lambda line: (line.page, line.box.top, line.box.left)),
-            crop_bottom,
-        )
+        with self._inference_lock:
+            image = cv2.imread(str(page_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise OcrUnavailableError(f"Could not read OCR page: {page_path.name}")
+            crop_bottom = float(round(image.shape[0] * fraction))
+            cropped = image[: int(crop_bottom), :]
+            lines: list[OcrLine] = []
+            for result in self._pipeline.predict(cropped):
+                lines.extend(_normalize_result(result, page_number))
+            return (
+                sorted(lines, key=lambda line: (line.page, line.box.top, line.box.left)),
+                crop_bottom,
+            )
 
     def recognize_upright_retry(self, page_path: Path, page_number: int) -> list[OcrLine]:
         """Retry a sideways image and directly recognize its small street row."""
+
+        with self._inference_lock:
+            return self._recognize_upright_retry_locked(page_path, page_number)
+
+    def _recognize_upright_retry_locked(
+        self,
+        page_path: Path,
+        page_number: int,
+    ) -> list[OcrLine]:
+        """Run the upright retry while the shared inference lock is held."""
 
         # The normal OCR page is intentionally capped for performance. Address
         # characters on an ID card can be only a few pixels high at that size,
@@ -154,6 +156,46 @@ class PaddleOcrEngine:
             text=text,
             confidence=max(0.0, min(1.0, confidence)),
             box=BoundingBox(left=left, top=top, right=right, bottom=bottom),
+        )
+
+
+def _ocr_import_error_message(error: ImportError) -> str:
+    """Distinguish a missing OCR package from a broken transitive dependency."""
+
+    missing_module = (getattr(error, "name", "") or "").split(".", 1)[0]
+    if missing_module == "paddleocr" and str(error).startswith("No module named"):
+        return (
+            "PaddleOCR is not installed in the Python environment running this app. "
+            "Start the app with the project environment or install the project requirements."
+        )
+    dependency = f" ({missing_module})" if missing_module else ""
+    return (
+        f"PaddleOCR is installed, but an OCR dependency could not be loaded{dependency}. "
+        "Restart the application. If the problem persists, repair or reinstall the application dependencies."
+    )
+
+
+def _create_paddle_pipeline() -> Any:
+    """Serialize the provider's import and model construction across UI sessions."""
+
+    with _OCR_INITIALIZATION_LOCK:
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError as error:
+            raise OcrUnavailableError(_ocr_import_error_message(error)) from error
+
+        # Mobile detection is a better CPU/local default than the much slower
+        # server detector. The Cyrillic model includes Bulgarian and English.
+        # Model files are downloaded on first use and then used locally.
+        return PaddleOCR(
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="cyrillic_PP-OCRv5_mobile_rec",
+            use_doc_orientation_classify=True,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=2400,
+            text_det_limit_type="max",
+            device="cpu",
         )
 
 

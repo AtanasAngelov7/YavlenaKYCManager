@@ -15,30 +15,81 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
+import pymupdf
+from dotenv import dotenv_values
+from playwright.sync_api import Browser, BrowserContext, Locator, Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from models import PersonalDocument, personal_document_fingerprint
-from storage import write_json
+from models import (
+    PersonalDocument,
+    personal_document_fingerprint,
+)
+from storage import file_sha256, read_validated_identity_snapshot, write_json
 from validation import is_valid_egn, normalize_date, validate_document
+from local_settings import remove_env_values, update_env_values
+from process_control import ProcessControlError, process_matches, terminate_process_tree
+from runtime_paths import (
+    CASES_ROOT,
+    RESOURCE_ROOT,
+    SETTINGS_PATH,
+    configure_packaged_browser,
+    is_frozen,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+PROJECT_ROOT = RESOURCE_ROOT
+DEFAULT_ENV_PATH = SETTINGS_PATH
 RMS_LOGIN_URL = "https://rms.bg/login"
 RMS_DASHBOARD_URL = "https://rms.bg/dashboard"
 RMS_STATUS_FILENAME = "rms-automation-status.json"
 RMS_LOCK_FILENAME = ".rms-automation.lock"
+RMS_STOP_REQUEST_FILENAME = ".rms-automation.stop"
+RMS_PDF_FILENAME = "rms-assessment.pdf"
+MAX_RMS_PDF_BYTES = 100 * 1024 * 1024
 ACTIVE_STATES = {
     "starting",
     "logging_in",
     "navigating",
     "filling",
+    "submitting",
+    "submitted",
     "filled",
     "needs_review",
 }
 RMS_CHROMIUM_LAUNCH_ARGS = ("--disable-notifications",)
+RMS_NO_CONTACT_PATTERN = re.compile(
+    r"^\s*Няма\s+данни\s*/\s*Не\s+е\s+представен\s*$",
+    re.IGNORECASE,
+)
+RMS_REPRESENTATIVE_PATTERN = re.compile(
+    r"Клиентът\s+се\s+представлява\s+от\s+(?:пълномощник|законен\s+представител)",
+    re.IGNORECASE,
+)
+RMS_WARNING_CONTINUE_PATTERN = re.compile(
+    r"^\s*Съгласявам\s+се\s+и\s+продължавам\s*$",
+    re.IGNORECASE,
+)
+RMS_FINAL_CONFIRMATION_PATTERN = re.compile(
+    r"(?:потвърждавам|декларирам|съгласявам\s+се).*(?:данн|оценк)",
+    re.IGNORECASE,
+)
+RMS_FINAL_SUBMIT_PATTERN = re.compile(
+    r"^\s*(?:Потвърди(?:\s+и)?\s+изпрати(?:\s+данните)?|"
+    r"Изпрати(?:\s+данните)?|Завърши(?:\s+оценката)?|"
+    r"Запази(?:\s+оценката)?|Направи\s+оценка)\s*$",
+    re.IGNORECASE,
+)
+RMS_PDF_DOWNLOAD_PATTERN = re.compile(
+    r"^\s*Свали\s+справките\s+в\s+PDF\s*$",
+    re.IGNORECASE,
+)
+RMS_SUBMISSION_SUCCESS_PATTERN = re.compile(
+    r"(?:оценката\s+(?:е|беше)\s+(?:създадена|запазена|изпратена)\s+успешно|"
+    r"успешно\s+(?:създадена|запазена|изпратена)\s+оценка|"
+    r"резултат\s+от\s+оценката|ниво\s+на\s+риск)",
+    re.IGNORECASE,
+)
 
 
 class WebsiteAutomationError(RuntimeError):
@@ -66,6 +117,26 @@ class RmsAutomationLaunch:
 
 
 @dataclass(frozen=True)
+class RmsSubmissionResult:
+    """Outcome of the one-shot RMS steps after the reviewed address page."""
+
+    confirmed: bool
+    submission_attempted: bool
+    completed_steps: tuple[str, ...] = ()
+    blockers: tuple[str, ...] = ()
+    reference: str = ""
+
+
+@dataclass(frozen=True)
+class RmsPdfArtifact:
+    """One verified case-bound PDF downloaded from the RMS result page."""
+
+    filename: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
 class RmsFieldSpec:
     """One identity value and conservative RMS control matches."""
 
@@ -73,7 +144,7 @@ class RmsFieldSpec:
     display_name: str
     label_patterns: tuple[str, ...]
     attribute_selectors: tuple[str, ...] = ()
-    autocomplete: bool = False
+    requires_transliteration: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,7 +250,7 @@ RMS_FIELD_SPECS = (
         "residence settlement",
         (),
         ("input[name='populated_place[]']",),
-        autocomplete=True,
+        requires_transliteration=True,
     ),
     RmsFieldSpec(
         "address_province",
@@ -308,14 +379,21 @@ RMS_REQUIRED_IDENTITY_KEYS = (
     "issued_by",
     "address",
 )
+RMS_MEANINGFUL_ADDRESS_KEYS = (
+    "address_province",
+    "address_street",
+    "address_number",
+    "address_neighborhood",
+    "address_block",
+)
 
 
 def load_rms_credentials(env_path: Path = DEFAULT_ENV_PATH) -> RmsCredentials:
     """Load RMS credentials from process environment or the local ignored .env file."""
 
-    load_dotenv(dotenv_path=env_path, override=False)
-    email = os.getenv("RMS_EMAIL", "").strip()
-    password = os.getenv("RMS_PASSWORD", "")
+    file_values = dotenv_values(env_path, interpolate=False) if env_path.is_file() else {}
+    email = (os.getenv("RMS_EMAIL") or file_values.get("RMS_EMAIL") or "").strip()
+    password = os.getenv("RMS_PASSWORD") or file_values.get("RMS_PASSWORD") or ""
     missing = [
         variable
         for variable, value in (("RMS_EMAIL", email), ("RMS_PASSWORD", password))
@@ -326,6 +404,33 @@ def load_rms_credentials(env_path: Path = DEFAULT_ENV_PATH) -> RmsCredentials:
             f"Set {', '.join(missing)} in the local .env file before opening RMS."
         )
     return RmsCredentials(email=email, password=password)
+
+
+def save_rms_credentials(
+    email: str,
+    password: str,
+    env_path: Path = DEFAULT_ENV_PATH,
+) -> RmsCredentials:
+    """Validate and save RMS credentials in the local per-user settings file."""
+
+    cleaned_email = email.strip()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", cleaned_email):
+        raise WebsiteNotConfiguredError("Enter a valid RMS account email address.")
+    if not password:
+        raise WebsiteNotConfiguredError("Enter the RMS account password.")
+    if any(character in password for character in ("\x00", "\r", "\n")):
+        raise WebsiteNotConfiguredError("The RMS account password must fit on one line.")
+    update_env_values(
+        env_path,
+        {"RMS_EMAIL": cleaned_email, "RMS_PASSWORD": password},
+    )
+    return RmsCredentials(email=cleaned_email, password=password)
+
+
+def remove_rms_credentials(env_path: Path = DEFAULT_ENV_PATH) -> None:
+    """Remove only RMS credentials from local per-user settings."""
+
+    remove_env_values(env_path, ("RMS_EMAIL", "RMS_PASSWORD"))
 
 
 def identity_field_values(document: PersonalDocument) -> dict[str, str]:
@@ -373,6 +478,15 @@ def rms_identity_issues(
     for key in RMS_REQUIRED_IDENTITY_KEYS:
         if not values.get(key, "").strip() and key not in existing_fields:
             issues.append(RmsIdentityIssue(key, "Required RMS value is missing."))
+    if not any(values.get(key, "").strip() for key in RMS_MEANINGFUL_ADDRESS_KEYS):
+        if "address" not in {issue.field for issue in issues}:
+            issues.append(
+                RmsIdentityIssue(
+                    "address",
+                    "The address needs a municipality, street, house number, neighbourhood, "
+                    "or block in addition to the settlement.",
+                )
+            )
 
     today = reference_date or date.today()
     date_values = {
@@ -536,16 +650,19 @@ def launch_rms_automation(
     lock_path, lock_token = _acquire_rms_lock(resolved_root.parent)
     try:
         _write_status(status_path, "starting", "Starting the visible RMS browser.")
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
+        command = [sys.executable]
+        if not is_frozen():
+            command.append(str(Path(__file__).resolve()))
+        command.extend(
+            [
             "--rms-worker",
             str(resolved_input),
             str(status_path),
             snapshot_sha256,
             str(lock_path),
             lock_token,
-        ]
+            ]
+        )
         options: dict[str, Any] = {
             "cwd": str(PROJECT_ROOT),
             "stdin": subprocess.DEVNULL,
@@ -600,17 +717,19 @@ def rms_status_is_active(status: dict[str, Any] | None) -> bool:
     return isinstance(pid, int) and _process_is_running(pid)
 
 
-def rms_worker_is_active(cases_root: Path = PROJECT_ROOT / "cases") -> bool:
+def rms_worker_is_active(cases_root: Path = CASES_ROOT) -> bool:
     """Return whether any case owns the single local RMS browser slot."""
 
     root = cases_root.resolve()
     lock_path = root / RMS_LOCK_FILENAME
     lock = _read_json_object(lock_path)
     if lock is not None:
-        pid = lock.get("pid")
-        if isinstance(pid, int) and _process_is_running(pid):
+        if _rms_lock_owner_is_active(lock_path, lock):
             return True
+        token = lock.get("token")
         lock_path.unlink(missing_ok=True)
+        if isinstance(token, str):
+            _clear_rms_stop_request(lock_path, token)
     elif lock_path.exists():
         # A just-created exclusive lock can be briefly visible before its JSON
         # payload is flushed. Treat it as active instead of stealing it.
@@ -620,14 +739,85 @@ def rms_worker_is_active(cases_root: Path = PROJECT_ROOT / "cases") -> bool:
         except OSError:
             return True
         lock_path.unlink(missing_ok=True)
+    return False
 
-    if not root.is_dir():
+
+def request_rms_automation_stop(cases_root: Path = CASES_ROOT) -> bool:
+    """Ask the exact worker holding the global RMS lock to close its browser.
+
+    The request carries the lock's random token, so an old request cannot stop a
+    later session. The worker observes it from its normal one-second polling loop
+    and releases the lock during its existing cleanup path.
+    """
+
+    root = cases_root.resolve()
+    lock_path = root / RMS_LOCK_FILENAME
+    lock = _read_json_object(lock_path)
+    if lock is None:
         return False
-    return any(
-        rms_status_is_active(read_rms_status(case_root))
-        for case_root in root.iterdir()
-        if case_root.is_dir()
+    pid = lock.get("pid")
+    token = lock.get("token")
+    if not isinstance(pid, int) or not isinstance(token, str) or not token:
+        return False
+    if not _rms_lock_owner_is_active(lock_path, lock):
+        lock_path.unlink(missing_ok=True)
+        _clear_rms_stop_request(lock_path, token)
+        return False
+    write_json(
+        _rms_stop_request_path(lock_path),
+        {
+            "token": token,
+            "requested_at": datetime.now().astimezone().isoformat(),
+        },
     )
+    return True
+
+
+def rms_stop_request_is_pending(cases_root: Path = CASES_ROOT) -> bool:
+    """Return whether the live RMS lock has a matching cooperative stop request."""
+
+    root = cases_root.resolve()
+    lock_path = root / RMS_LOCK_FILENAME
+    lock = _read_json_object(lock_path)
+    if lock is None or not _rms_lock_owner_is_active(lock_path, lock):
+        return False
+    token = lock.get("token")
+    return isinstance(token, str) and _rms_stop_requested(lock_path, token)
+
+
+def force_close_rms_automation(cases_root: Path = CASES_ROOT) -> bool:
+    """Force-close an unresponsive worker only after verifying its exact lock token."""
+
+    root = cases_root.resolve()
+    lock_path = root / RMS_LOCK_FILENAME
+    lock = _read_json_object(lock_path)
+    if lock is None:
+        return False
+    pid = lock.get("pid")
+    token = lock.get("token")
+    if not isinstance(pid, int) or not isinstance(token, str) or not token:
+        raise WebsiteAutomationError(
+            "The RMS lock is malformed and no process was closed. Restart the application."
+        )
+    if lock.get("state") == "starting":
+        raise WebsiteAutomationError(
+            "The RMS worker is still starting. Wait a moment, refresh, and try again."
+        )
+    if not _rms_worker_process_matches_lock(pid, lock_path, token):
+        if not _process_is_running(pid):
+            lock_path.unlink(missing_ok=True)
+            _clear_rms_stop_request(lock_path, token)
+            return False
+        raise WebsiteAutomationError(
+            "The process recorded by the RMS lock could not be verified as this application's "
+            "worker, so it was not closed. Restart Windows if the lock remains."
+        )
+    try:
+        terminate_process_tree(pid)
+    except ProcessControlError as error:
+        raise WebsiteAutomationError(str(error)) from error
+    _release_rms_lock(lock_path, token)
+    return True
 
 
 def _acquire_rms_lock(cases_root: Path) -> tuple[Path, str]:
@@ -639,9 +829,17 @@ def _acquire_rms_lock(cases_root: Path) -> tuple[Path, str]:
     lock_path = root / RMS_LOCK_FILENAME
     token = hashlib.sha256(os.urandom(32)).hexdigest()
     payload = json.dumps(
-        {"pid": os.getpid(), "token": token},
+        {
+            "pid": os.getpid(),
+            "token": token,
+            "state": "starting",
+            "created_at": time.time(),
+        },
         ensure_ascii=True,
     ).encode("utf-8")
+    # No live owner exists at this point, so discard any request left by an
+    # older token before publishing the new lock.
+    _rms_stop_request_path(lock_path).unlink(missing_ok=True)
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as error:
@@ -657,13 +855,52 @@ def _update_rms_lock(lock_path: Path, token: str, worker_pid: int) -> None:
     lock = _read_json_object(lock_path)
     if lock is None or lock.get("token") != token:
         raise WebsiteAutomationError("The RMS browser lock was lost before startup completed.")
-    write_json(lock_path, {"pid": worker_pid, "token": token})
+    write_json(lock_path, {"pid": worker_pid, "token": token, "state": "worker"})
 
 
 def _release_rms_lock(lock_path: Path, token: str) -> None:
     lock = _read_json_object(lock_path)
     if lock is not None and lock.get("token") == token:
         lock_path.unlink(missing_ok=True)
+    _clear_rms_stop_request(lock_path, token)
+
+
+def _rms_stop_request_path(lock_path: Path) -> Path:
+    return lock_path.with_name(RMS_STOP_REQUEST_FILENAME)
+
+
+def _rms_stop_requested(lock_path: Path, token: str) -> bool:
+    request = _read_json_object(_rms_stop_request_path(lock_path))
+    return request is not None and request.get("token") == token
+
+
+def _clear_rms_stop_request(lock_path: Path, token: str) -> None:
+    request_path = _rms_stop_request_path(lock_path)
+    request = _read_json_object(request_path)
+    if request is not None and request.get("token") == token:
+        request_path.unlink(missing_ok=True)
+
+
+def _rms_lock_owner_is_active(lock_path: Path, lock: dict[str, Any]) -> bool:
+    pid = lock.get("pid")
+    token = lock.get("token")
+    if not isinstance(pid, int) or not isinstance(token, str) or not token:
+        return False
+    if lock.get("state") == "starting":
+        created_at = lock.get("created_at")
+        return (
+            isinstance(created_at, (int, float))
+            and time.time() - float(created_at) < 10
+            and _process_is_running(pid)
+        )
+    return _rms_worker_process_matches_lock(pid, lock_path, token)
+
+
+def _rms_worker_process_matches_lock(pid: int, lock_path: Path, token: str) -> bool:
+    return process_matches(
+        pid,
+        required_arguments=("--rms-worker", lock_path.resolve(), token),
+    )
 
 
 def _read_json_object(path: Path) -> dict[str, Any] | None:
@@ -681,9 +918,13 @@ def _run_rms_worker(
     lock_path: Path | None = None,
     lock_token: str = "",
 ) -> None:
-    """Fill the first two RMS identity stages, then keep the browser open without submitting."""
+    """Fill and submit one RMS assessment, then keep its result visible for review."""
 
+    submission_result: RmsSubmissionResult | None = None
+    pdf_artifact: RmsPdfArtifact | None = None
+    pdf_download_error = ""
     try:
+        configure_packaged_browser()
         document, _ = _read_validated_identity_snapshot(
             final_json,
             expected_sha256=expected_sha256,
@@ -704,9 +945,7 @@ def _run_rms_worker(
                 "Opening the individual-client risk-profile form.",
                 pid=os.getpid(),
             )
-            page.goto(RMS_DASHBOARD_URL, wait_until="domcontentloaded", timeout=60_000)
-            _click_named(page, "Направи оценка")
-            _click_named(page, "Рисков профил на клиент - физическо лице")
+            _open_individual_client_profile(page)
             try:
                 page.wait_for_load_state("networkidle", timeout=15_000)
             except PlaywrightTimeoutError:
@@ -721,9 +960,35 @@ def _run_rms_worker(
             )
             initial_page_advanced = False
             document_page_advanced = False
+            remaining_flow_attempted = False
             last_report: tuple[str, tuple[str, ...], tuple[str, ...]] | None = None
-            while browser.is_connected():
+            while _rms_browser_session_is_open(
+                browser,
+                context,
+                page,
+                lock_path=lock_path,
+                lock_token=lock_token,
+            ):
                 stage = _visible_rms_stage(page)
+                if stage == "unsupported":
+                    blockers = (
+                        "Supported RMS identity section (the page may still be loading or its layout may have changed)",
+                    )
+                    report = (stage, (), blockers)
+                    if report != last_report:
+                        _write_status(
+                            status_path,
+                            _rms_stage_state(stage, blockers),
+                            "The current RMS page is not a supported identity section. "
+                            "The browser remains open for manual review; the automation did not submit the final assessment.",
+                            pid=os.getpid(),
+                            rms_stage=stage,
+                            filled_fields=[],
+                            unmatched_fields=list(blockers),
+                        )
+                        last_report = report
+                    time.sleep(1)
+                    continue
                 specs, include_country_defaults = _field_specs_for_stage(stage)
                 filled, unmatched = _fill_identity_fields(
                     page,
@@ -754,15 +1019,90 @@ def _run_rms_worker(
                         blocker for blocker in blockers if blocker not in unmatched
                     )
 
+                if stage == "address" and not unmatched and not remaining_flow_attempted:
+                    remaining_flow_attempted = True
+                    _write_status(
+                        status_path,
+                        "submitting",
+                        "Completing the RMS contact and representative pages, then submitting "
+                        "the assessment once.",
+                        pid=os.getpid(),
+                        rms_stage="post_address",
+                    )
+                    submission_result = _complete_remaining_rms_pages(page)
+                    if submission_result.confirmed:
+                        try:
+                            pdf_artifact = _download_rms_pdf(page, status_path)
+                        except Exception:
+                            pdf_download_error = (
+                                "RMS confirmed the assessment, but its PDF could not be downloaded "
+                                "or validated. Use the open RMS result page to download it manually."
+                            )
+                        common_details = {
+                            "pid": os.getpid(),
+                            "rms_stage": "result",
+                            "completed_steps": list(submission_result.completed_steps),
+                            "submission_attempted": True,
+                            "submission_confirmed": True,
+                            "submission_reference": submission_result.reference,
+                        }
+                        if pdf_artifact is not None:
+                            _write_status(
+                                status_path,
+                                "submitted",
+                                "RMS confirmed the assessment and its PDF was saved locally. "
+                                "The result remains open in the visible browser for review.",
+                                **common_details,
+                                **_rms_pdf_status_details(pdf_artifact),
+                            )
+                        else:
+                            _write_status(
+                                status_path,
+                                "needs_review",
+                                pdf_download_error,
+                                **common_details,
+                                pdf_downloaded=False,
+                                unmatched_fields=["RMS assessment PDF"],
+                            )
+                    else:
+                        attempted_note = (
+                            "The final submit control was clicked once, but RMS confirmation "
+                            "could not be verified. Do not launch the automation again; review "
+                            "the open browser to avoid a duplicate assessment."
+                            if submission_result.submission_attempted
+                            else "RMS stopped before final submission. Complete the listed step "
+                            "manually in the open browser."
+                        )
+                        _write_status(
+                            status_path,
+                            "needs_review",
+                            attempted_note,
+                            pid=os.getpid(),
+                            rms_stage="post_address",
+                            completed_steps=list(submission_result.completed_steps),
+                            unmatched_fields=list(submission_result.blockers),
+                            submission_attempted=submission_result.submission_attempted,
+                            submission_confirmed=False,
+                        )
+                    while _rms_browser_session_is_open(
+                        browser,
+                        context,
+                        page,
+                        lock_path=lock_path,
+                        lock_token=lock_token,
+                    ):
+                        time.sleep(1)
+                    break
+
                 report = (stage, tuple(filled), tuple(unmatched))
                 if report != last_report:
                     if stage == "address":
                         message = (
                             "The address page is partially filled and the listed fields need manual review. "
-                            "The browser remains open; nothing was submitted."
+                            "The browser remains open; the automation did not submit the final assessment."
                             if unmatched
                             else "The identity, identification-document, and address pages are filled. "
-                            "The browser remains open for review; nothing was submitted."
+                            "The remaining RMS pages are ready to be completed."
                         )
                     elif stage == "document":
                         message = (
@@ -775,13 +1115,12 @@ def _run_rms_worker(
                             "required identity values are present."
                         )
                     else:
-                        message = (
-                            "Matching reviewed identity fields on the current RMS page are filled. "
-                            "Nothing was submitted."
+                        raise WebsiteAutomationError(
+                            "RMS reached an unsupported page while filling identity details."
                         )
                     _write_status(
                         status_path,
-                        "needs_review" if unmatched else "filled",
+                        _rms_stage_state(stage, unmatched),
                         message,
                         pid=os.getpid(),
                         rms_stage=stage,
@@ -790,12 +1129,67 @@ def _run_rms_worker(
                     )
                     last_report = report
                 time.sleep(1)
-        _write_status(status_path, "closed", "The RMS browser session was closed.")
+        if (
+            submission_result is not None
+            and submission_result.confirmed
+            and pdf_artifact is not None
+        ):
+            _write_status(
+                status_path,
+                "completed",
+                "The RMS assessment and verified PDF were saved; its browser session was closed.",
+                submission_confirmed=True,
+                submission_reference=submission_result.reference,
+                **_rms_pdf_status_details(pdf_artifact),
+            )
+        elif submission_result is not None and submission_result.confirmed:
+            _write_status(
+                status_path,
+                "needs_review",
+                pdf_download_error
+                or "The RMS assessment was submitted, but no verified PDF was saved locally.",
+                submission_attempted=True,
+                submission_confirmed=True,
+                submission_reference=submission_result.reference,
+                pdf_downloaded=False,
+                unmatched_fields=["RMS assessment PDF"],
+            )
+        else:
+            _write_status(
+                status_path,
+                "closed",
+                "The RMS browser session was closed without a verified submission.",
+                submission_attempted=(
+                    submission_result.submission_attempted
+                    if submission_result is not None
+                    else False
+                ),
+                submission_confirmed=False,
+            )
     except Exception as error:
         _write_status(status_path, "error", _safe_worker_error(error), pid=os.getpid())
     finally:
         if lock_path is not None and lock_token:
             _release_rms_lock(lock_path, lock_token)
+
+
+def _rms_browser_session_is_open(
+    browser: Browser,
+    context: BrowserContext,
+    page: Page,
+    *,
+    lock_path: Path | None = None,
+    lock_token: str = "",
+) -> bool:
+    """Return false as soon as the operator closes the visible RMS page or browser."""
+
+    try:
+        if lock_path is not None and lock_token and _rms_stop_requested(lock_path, lock_token):
+            return False
+        return browser.is_connected() and not page.is_closed() and page in context.pages
+    except Exception:
+        # A browser/context teardown can race with this worker's polling loop.
+        return False
 
 
 def _read_validated_identity_snapshot(
@@ -806,18 +1200,16 @@ def _read_validated_identity_snapshot(
     """Read, hash, and fully validate one immutable RMS identity snapshot."""
 
     try:
-        payload = path.read_bytes()
-    except OSError as error:
-        raise WebsiteAutomationError("The saved identity snapshot could not be read.") from error
-    snapshot_sha256 = hashlib.sha256(payload).hexdigest()
-    if expected_sha256 and snapshot_sha256 != expected_sha256:
-        raise WebsiteAutomationError(
-            "The saved identity snapshot changed after RMS launch. Nothing was sent."
+        validated = read_validated_identity_snapshot(
+            path,
+            expected_snapshot_sha256=expected_sha256,
         )
-    try:
-        document = PersonalDocument.model_validate_json(payload)
     except ValueError as error:
-        raise WebsiteAutomationError("The saved identity snapshot is invalid.") from error
+        message = str(error)
+        if expected_sha256 and "changed after it was selected" in message:
+            message = "The saved identity snapshot changed after RMS launch. Nothing was sent."
+        raise WebsiteAutomationError(message) from error
+    document = validated.snapshot.document
     identity_issues = rms_identity_issues(document)
     if identity_issues:
         details = "; ".join(
@@ -828,7 +1220,7 @@ def _read_validated_identity_snapshot(
             "The saved identity snapshot is not ready for RMS. "
             f"Correct and save it again: {details}"
         )
-    return document, snapshot_sha256
+    return document, validated.snapshot_sha256
 
 
 def _await_launcher_status(status_path: Path, worker_pid: int) -> None:
@@ -862,6 +1254,17 @@ def _login(page: Page, credentials: RmsCredentials) -> None:
         raise WebsiteAutomationError(
             "RMS did not accept the login or requires an additional manual action."
         ) from error
+
+
+def _open_individual_client_profile(page: Page) -> None:
+    """Reach the supported RMS form while clearing overlays before every action."""
+
+    page.goto(RMS_DASHBOARD_URL, wait_until="domcontentloaded", timeout=60_000)
+    _dismiss_cookie_consent(page)
+    _click_named(page, "Направи оценка")
+    _dismiss_cookie_consent(page)
+    _click_named(page, "Рисков профил на клиент - физическо лице")
+    _dismiss_cookie_consent(page)
 
 
 def _launch_visible_rms_browser(playwright: Any) -> Any:
@@ -912,13 +1315,18 @@ def _fill_identity_fields(
             unmatched.append(spec.display_name)
             continue
         try:
-            outcome = _set_rms_control_value(page, target, value, autocomplete=spec.autocomplete)
+            outcome = _set_rms_control_value(
+                page,
+                target,
+                value,
+                requires_transliteration=spec.requires_transliteration,
+            )
             if outcome == "filled":
                 filled.append(spec.display_name)
             elif outcome == "preserved":
                 unmatched.append(f"{spec.display_name} (operator value preserved)")
             else:
-                unmatched.append(f"{spec.display_name} (autocomplete selection requires review)")
+                unmatched.append(f"{spec.display_name} (RMS transliteration requires review)")
         except Exception:
             unmatched.append(f"{spec.display_name} (could not be filled safely)")
     country_defaults = (
@@ -955,7 +1363,7 @@ def _set_rms_control_value(
     target: Locator,
     value: str,
     *,
-    autocomplete: bool = False,
+    requires_transliteration: bool = False,
 ) -> str:
     """Set one RMS control while distinguishing placeholders from operator input."""
 
@@ -979,8 +1387,8 @@ def _set_rms_control_value(
             raise WebsiteAutomationError("RMS did not accept the requested dropdown value.")
         return "filled"
 
-    if autocomplete:
-        return _set_rms_autocomplete_value(page, target, value)
+    if requires_transliteration:
+        return _set_rms_transliterated_value(page, target, value)
     if _same_rms_value(current_value, value):
         return "filled"
     if current_value:
@@ -989,47 +1397,64 @@ def _set_rms_control_value(
     return "filled"
 
 
-def _set_rms_autocomplete_value(page: Page, target: Locator, value: str) -> str:
-    if target.get_attribute("data-yavlena-autocomplete-committed") == "true":
-        current_value = target.input_value().strip()
-        if not current_value or target.get_attribute("aria-invalid") == "true":
-            return "unverified"
-        return "filled" if _same_settlement(current_value, value) else "preserved"
+def _set_rms_transliterated_value(page: Page, target: Locator, value: str) -> str:
+    """Type a locality so RMS creates and fills its required Latin companion field."""
+
     current_value = target.input_value().strip()
     if current_value and not _same_rms_value(current_value, value):
         return "preserved"
-    if target.get_attribute("data-yavlena-autocomplete-attempted") == "true":
+    if _transliterated_settlement_is_valid(page, target, value):
+        target.evaluate("element => element.dataset.yavlenaTransliterationVerified = 'true'")
+        return "filled"
+    if target.get_attribute("data-yavlena-transliteration-attempted") == "true":
         return "unverified"
-    target.evaluate("element => element.dataset.yavlenaAutocompleteAttempted = 'true'")
-    target.fill(value)
-    page.wait_for_timeout(500)
+    target.evaluate("element => element.dataset.yavlenaTransliterationAttempted = 'true'")
 
-    candidate = _matching_settlement_candidate(page, value)
-    if candidate is None:
+    # RMS creates the required transliteration control from per-key requests.
+    # Playwright's bulk fill() emits input/change events but no key events, so it
+    # leaves the apparently populated page invalid and Next does nothing.
+    target.fill("")
+    target.click()
+    target.press_sequentially(value, delay=40)
+    if not _wait_for_transliterated_settlement(page, target, value, timeout_ms=5_000):
         return "unverified"
-    candidate.click()
-    page.wait_for_timeout(200)
-    if (
-        not _same_settlement(target.input_value(), value)
-        or target.get_attribute("aria-invalid") == "true"
-    ):
-        return "unverified"
-    target.evaluate("element => element.dataset.yavlenaAutocompleteCommitted = 'true'")
+    target.evaluate("element => element.dataset.yavlenaTransliterationVerified = 'true'")
     return "filled"
 
 
-def _matching_settlement_candidate(page: Page, requested_value: str) -> Locator | None:
-    candidates = page.locator(
-        "[role='listbox'] [role='option'], [role='option'], "
-        ".autocomplete-suggestion, .ui-autocomplete .ui-menu-item, .tt-suggestion, "
-        "input[name='populated_place[]'] ~ ul li"
-    )
-    matches: list[Locator] = []
-    for index in range(candidates.count()):
-        candidate = candidates.nth(index)
-        if candidate.is_visible() and _same_settlement(candidate.inner_text(), requested_value):
-            matches.append(candidate)
-    return matches[0] if len(matches) == 1 else None
+def _wait_for_transliterated_settlement(
+    page: Page,
+    target: Locator,
+    requested_value: str,
+    *,
+    timeout_ms: int,
+) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1_000
+    while time.monotonic() < deadline:
+        if _transliterated_settlement_is_valid(page, target, requested_value):
+            return True
+        page.wait_for_timeout(100)
+    return _transliterated_settlement_is_valid(page, target, requested_value)
+
+
+def _transliterated_settlement_is_valid(
+    page: Page,
+    target: Locator,
+    requested_value: str,
+) -> bool:
+    try:
+        companion = _one_visible(
+            page.locator("input[name='transliterate_populated_place[]']")
+        )
+        return bool(
+            companion is not None
+            and target.get_attribute("aria-invalid") != "true"
+            and companion.get_attribute("aria-invalid") != "true"
+            and _same_settlement(target.input_value(), requested_value)
+            and _same_settlement(companion.input_value(), requested_value)
+        )
+    except Exception:
+        return False
 
 
 BULGARIAN_TRANSLITERATION = {
@@ -1136,6 +1561,13 @@ def _field_specs_for_stage(stage: str) -> tuple[tuple[RmsFieldSpec, ...], bool]:
     return (), False
 
 
+def _rms_stage_state(stage: str, unmatched: list[str] | tuple[str, ...]) -> str:
+    """Never report success for an unknown page, even when no fields were attempted."""
+
+    supported = stage in {"initial", "document", "address"}
+    return "filled" if supported and not unmatched else "needs_review"
+
+
 def _advance_to_document_section(
     page: Page,
     *,
@@ -1212,6 +1644,370 @@ def _advance_to_address_section(
     )
 
 
+def _complete_remaining_rms_pages(page: Page) -> RmsSubmissionResult:
+    """Complete the known post-address pages and click final submission at most once."""
+
+    completed: list[str] = []
+    submission_attempted = False
+    try:
+        _dismiss_cookie_consent(page)
+        next_button = _first_visible(page.locator("button#next_btn"))
+        if next_button is None:
+            return _submission_blocked(completed, "Address-page Next action was not found")
+        next_button.click()
+
+        contact_checkbox = _wait_for_checkbox(page, RMS_NO_CONTACT_PATTERN, timeout_ms=1_500)
+        if contact_checkbox is None:
+            warning_continue = _wait_for_named_button(
+                page,
+                RMS_WARNING_CONTINUE_PATTERN,
+                timeout_ms=6_000,
+            )
+            if warning_continue is None:
+                return _submission_blocked(
+                    completed,
+                    "RMS warning confirmation was not found after the address page",
+                )
+            warning_continue.click()
+            completed.append("incomplete-data warning accepted")
+            contact_checkbox = _wait_for_checkbox(
+                page,
+                RMS_NO_CONTACT_PATTERN,
+                timeout_ms=10_000,
+            )
+        if contact_checkbox is None:
+            return _submission_blocked(completed, "Contact-details page did not open")
+        if not contact_checkbox.is_checked():
+            contact_checkbox.check()
+        if not contact_checkbox.is_checked():
+            return _submission_blocked(
+                completed,
+                "No-contact-details checkbox could not be selected",
+            )
+        completed.append("no contact details selected")
+
+        _dismiss_cookie_consent(page)
+        next_button = _first_visible(page.locator("button#next_btn"))
+        if next_button is None:
+            return _submission_blocked(completed, "Contact-page Next action was not found")
+        next_button.click()
+        representative_checkbox = _wait_for_checkbox(
+            page,
+            RMS_REPRESENTATIVE_PATTERN,
+            timeout_ms=10_000,
+        )
+        if representative_checkbox is None:
+            return _submission_blocked(completed, "Representative page did not open")
+        if representative_checkbox.is_checked():
+            return _submission_blocked(
+                completed,
+                "Representative checkbox was unexpectedly selected and was preserved for review",
+            )
+        completed.append("representative left unselected")
+
+        _dismiss_cookie_consent(page)
+        next_button = _first_visible(page.locator("button#next_btn"))
+        if next_button is None:
+            return _submission_blocked(
+                completed,
+                "Representative-page Next action was not found",
+            )
+        next_button.click()
+
+        original_url = page.url
+        final_continue = _wait_for_named_button(
+            page,
+            RMS_WARNING_CONTINUE_PATTERN,
+            timeout_ms=3_000,
+        )
+        if final_continue is not None:
+            # The current RMS layout uses this warning confirmation itself as
+            # the one-shot action that sends the identity flow and consumes an
+            # assessment. It must never be followed by a speculative retry.
+            final_continue.click()
+            submission_attempted = True
+            completed.append("final warning confirmed and submission clicked")
+        else:
+            # Retain the older explicit declaration + submit layout as a safe
+            # fallback while still allowing only one final click.
+            final_confirmation = _wait_for_checkbox(
+                page,
+                RMS_FINAL_CONFIRMATION_PATTERN,
+                timeout_ms=1_500,
+            )
+            if final_confirmation is not None:
+                if not final_confirmation.is_checked():
+                    final_confirmation.check()
+                if not final_confirmation.is_checked():
+                    return _submission_blocked(
+                        completed,
+                        "Final confirmation checkbox could not be selected",
+                    )
+                completed.append("final declaration confirmed")
+
+            submit_button = _wait_for_named_button(
+                page,
+                RMS_FINAL_SUBMIT_PATTERN,
+                timeout_ms=10_000,
+            )
+            if submit_button is None:
+                return _submission_blocked(completed, "Final RMS submit action was not found")
+            submit_button.click()
+            submission_attempted = True
+            completed.append("final submission clicked")
+
+        confirmed, reference = _wait_for_submission_confirmation(
+            page,
+            original_url=original_url,
+            timeout_ms=15_000,
+        )
+        if not confirmed:
+            return RmsSubmissionResult(
+                confirmed=False,
+                submission_attempted=True,
+                completed_steps=tuple(completed),
+                blockers=("RMS submission confirmation could not be verified",),
+            )
+        completed.append("RMS submission confirmed")
+        return RmsSubmissionResult(
+            confirmed=True,
+            submission_attempted=True,
+            completed_steps=tuple(completed),
+            reference=reference,
+        )
+    except Exception:
+        blocker = (
+            "RMS changed or closed after the final submit action; submission state is uncertain"
+            if submission_attempted
+            else "RMS changed or closed before the remaining pages were completed"
+        )
+        return RmsSubmissionResult(
+            confirmed=False,
+            submission_attempted=submission_attempted,
+            completed_steps=tuple(completed),
+            blockers=(blocker,),
+        )
+
+
+def _submission_blocked(completed: list[str], blocker: str) -> RmsSubmissionResult:
+    return RmsSubmissionResult(
+        confirmed=False,
+        submission_attempted=False,
+        completed_steps=tuple(completed),
+        blockers=(blocker,),
+    )
+
+
+def _wait_for_checkbox(
+    page: Page,
+    label_pattern: re.Pattern[str],
+    *,
+    timeout_ms: int,
+) -> Locator | None:
+    deadline = time.monotonic() + timeout_ms / 1_000
+    while time.monotonic() < deadline:
+        checkbox = _find_checkbox(page, label_pattern)
+        if checkbox is not None:
+            return checkbox
+        page.wait_for_timeout(100)
+    return _find_checkbox(page, label_pattern)
+
+
+def _find_checkbox(page: Page, label_pattern: re.Pattern[str]) -> Locator | None:
+    labelled = _one_visible(page.get_by_label(label_pattern))
+    if labelled is not None and labelled.get_attribute("type") == "checkbox":
+        return labelled
+    candidates = page.locator("label").filter(has_text=label_pattern).locator("input[type='checkbox']")
+    return _one_visible(candidates)
+
+
+def _wait_for_named_button(
+    page: Page,
+    name_pattern: re.Pattern[str],
+    *,
+    timeout_ms: int,
+) -> Locator | None:
+    deadline = time.monotonic() + timeout_ms / 1_000
+    while time.monotonic() < deadline:
+        button = _one_visible(page.get_by_role("button", name=name_pattern))
+        if button is not None:
+            return button
+        page.wait_for_timeout(100)
+    return _one_visible(page.get_by_role("button", name=name_pattern))
+
+
+def _wait_for_submission_confirmation(
+    page: Page,
+    *,
+    original_url: str,
+    timeout_ms: int,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + timeout_ms / 1_000
+    while time.monotonic() < deadline:
+        current_url = page.url
+        if current_url != original_url:
+            return True, _submission_reference(page, current_url)
+        confirmation = _first_visible(page.get_by_text(RMS_SUBMISSION_SUCCESS_PATTERN))
+        if confirmation is not None:
+            return True, _submission_reference(page, current_url)
+        if _find_named_action(page, RMS_PDF_DOWNLOAD_PATTERN) is not None:
+            return True, _submission_reference(page, current_url)
+        page.wait_for_timeout(150)
+    return False, ""
+
+
+def _download_rms_pdf(page: Page, status_path: Path) -> RmsPdfArtifact:
+    """Download the result PDF once and promote it only after local validation."""
+
+    case_root = status_path.resolve().parent
+    output_directory = (case_root / "output").resolve()
+    if (
+        status_path.name != RMS_STATUS_FILENAME
+        or output_directory.parent != case_root
+        or not output_directory.is_dir()
+        or output_directory.is_symlink()
+    ):
+        raise WebsiteAutomationError("The RMS PDF destination is not a valid case directory.")
+    action = _wait_for_named_action(page, RMS_PDF_DOWNLOAD_PATTERN, timeout_ms=15_000)
+    if action is None:
+        raise WebsiteAutomationError("The RMS PDF download action was not found on the result page.")
+
+    destination = output_directory / RMS_PDF_FILENAME
+    temporary = output_directory / f".{RMS_PDF_FILENAME}.{os.getpid()}.tmp"
+    try:
+        temporary.unlink(missing_ok=True)
+        with page.expect_download(timeout=30_000) as download_info:
+            action.click()
+        download_info.value.save_as(temporary)
+        size = _validate_rms_pdf_file(temporary)
+        digest = file_sha256(temporary)
+        temporary.replace(destination)
+    except Exception as error:
+        raise WebsiteAutomationError(
+            "The RMS result PDF could not be downloaded and validated."
+        ) from error
+    finally:
+        temporary.unlink(missing_ok=True)
+    return RmsPdfArtifact(filename=destination.name, sha256=digest, size=size)
+
+
+def _wait_for_named_action(
+    page: Page,
+    name_pattern: re.Pattern[str],
+    *,
+    timeout_ms: int,
+) -> Locator | None:
+    deadline = time.monotonic() + timeout_ms / 1_000
+    while time.monotonic() < deadline:
+        action = _find_named_action(page, name_pattern)
+        if action is not None:
+            return action
+        page.wait_for_timeout(100)
+    return _find_named_action(page, name_pattern)
+
+
+def _find_named_action(page: Page, name_pattern: re.Pattern[str]) -> Locator | None:
+    for role in ("button", "link"):
+        action = _one_visible(page.get_by_role(role, name=name_pattern))
+        if action is not None:
+            return action
+    return None
+
+
+def _validate_rms_pdf_file(path: Path) -> int:
+    size = path.stat().st_size
+    if size < 5 or size > MAX_RMS_PDF_BYTES:
+        raise WebsiteAutomationError("The RMS PDF has an invalid file size.")
+    with path.open("rb") as source:
+        if source.read(5) != b"%PDF-":
+            raise WebsiteAutomationError("The RMS download is not a PDF document.")
+    try:
+        with pymupdf.open(path) as document:
+            if not document.is_pdf or document.needs_pass or document.page_count < 1:
+                raise WebsiteAutomationError(
+                    "The RMS download is not a readable PDF document."
+                )
+            # A header-only check accepts truncated files. Loading every page verifies
+            # the page tree without rendering or retaining any personal contents.
+            for page_number in range(document.page_count):
+                page = document.load_page(page_number)
+                if page.rect.width <= 0 or page.rect.height <= 0:
+                    raise WebsiteAutomationError(
+                        "The RMS download contains an invalid PDF page."
+                    )
+    except WebsiteAutomationError:
+        raise
+    except Exception as error:
+        raise WebsiteAutomationError(
+            "The RMS download is not a readable PDF document."
+        ) from error
+    return size
+
+
+def _rms_pdf_status_details(artifact: RmsPdfArtifact) -> dict[str, Any]:
+    return {
+        "pdf_downloaded": True,
+        "rms_pdf_filename": artifact.filename,
+        "rms_pdf_sha256": artifact.sha256,
+        "rms_pdf_size": artifact.size,
+    }
+
+
+def validated_rms_pdf_path(case_root: Path, status: dict[str, Any]) -> Path | None:
+    """Return only an intact PDF bound to RMS's persisted artifact metadata."""
+
+    metadata = (
+        status.get("rms_pdf_filename"),
+        status.get("rms_pdf_sha256"),
+        status.get("rms_pdf_size"),
+    )
+    if not any(value not in (None, "") for value in metadata):
+        return None
+    filename, expected_sha256, expected_size = metadata
+    if (
+        status.get("submission_confirmed") is not True
+        or status.get("pdf_downloaded") is not True
+        or filename != RMS_PDF_FILENAME
+        or not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or type(expected_size) is not int
+        or not 5 <= expected_size <= MAX_RMS_PDF_BYTES
+    ):
+        raise WebsiteAutomationError("The saved RMS PDF metadata is invalid.")
+
+    root = case_root.resolve()
+    output_directory = (root / "output").resolve()
+    pdf_path = (output_directory / filename).resolve()
+    if (
+        output_directory.parent != root
+        or pdf_path.parent != output_directory
+        or output_directory.is_symlink()
+        or pdf_path.is_symlink()
+        or not pdf_path.is_file()
+        or pdf_path.stat().st_size != expected_size
+        or file_sha256(pdf_path) != expected_sha256
+    ):
+        raise WebsiteAutomationError("The saved RMS PDF is missing or failed integrity validation.")
+    _validate_rms_pdf_file(pdf_path)
+    return pdf_path
+
+
+def _submission_reference(page: Page, current_url: str) -> str:
+    url_match = re.search(r"/(?:checks?|assessments?|evaluations?)/(\d+)(?:[/?#]|$)", current_url)
+    if url_match:
+        return url_match.group(1)
+    try:
+        visible_text = page.locator("body").inner_text()
+    except Exception:
+        return ""
+    text_match = re.search(
+        r"(?:оценка|профил)\s*(?:№|номер|id)?\s*[:#№]?\s*([A-Z0-9][A-Z0-9-]{3,})",
+        visible_text,
+        re.IGNORECASE,
+    )
+    return text_match.group(1) if text_match else ""
+
+
 def _click_next_and_wait(
     page: Page,
     *,
@@ -1282,8 +2078,14 @@ def _safe_worker_error(error: Exception) -> str:
     if isinstance(error, WebsiteAutomationError):
         return str(error)
     if isinstance(error, PlaywrightTimeoutError):
-        return "RMS did not reach the expected page before the timeout. Nothing was submitted."
-    return "RMS automation stopped because of an unexpected browser error. Nothing was submitted."
+        return (
+            "RMS did not reach the expected page before the timeout. "
+            "The automation did not submit the final assessment."
+        )
+    return (
+        "RMS automation stopped because of an unexpected browser error. "
+        "The automation did not submit the final assessment."
+    )
 
 
 def _process_is_running(pid: int) -> bool:

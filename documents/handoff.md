@@ -1,9 +1,35 @@
 # Yavlena KYC Manager — Development Handoff
 
+## Актуализация 2026-09-01 — lifecycle и provenance
+
+- `final.json` е версиониран `ApprovedIdentitySnapshot`, обвързан с `case_id` и SHA-256 на `extracted.json`. Legacy или несъответстващ запис изисква нов операторски преглед.
+- Създаването и изтриването на казуси са двуфазни. Прекъснати private-file cleanup директории се откриват безопасно и UI предлага повторно почистване.
+- Един per-case file lock сериализира промените от различни Streamlit tabs и се проверява отново преди изтриване или RMS launch.
+- RMS/OpenAI credentials имат отделни remove действия; `.env` read-modify-write е синхронизиран и запазва несвързаните настройки.
+- RMS текстът не твърди какво е направил операторът след автоматизацията; посочва само, че самата автоматизация не е изпратила крайната оценка.
+- Един споделен валидатор вече е задължителната граница за RMS, договорите, възстановяването на казуси и имотния OCR: `final.json` трябва да съвпада с текущия казус и точния `extracted.json`.
+- Запазването на прегледа сравнява SHA-256 на OCR данните, които операторът действително е видял. Остарял таб не може да одобри по-нова екстракция, а договор или имотен OCR не може да използва стара самоличност.
+- Запазването използва и compare-and-swap версия на самия `final.json`: два таба не могат безшумно да презапишат взаимно редакциите си дори когато работят върху една и съща OCR екстракция.
+- Целият първоначален OCR е под per-case lock. Изоставени `.property-candidate-*` директории се откриват и почистват от същия безопасен recovery механизъм.
+- След придобиване на per-case lock директорията се валидира повторно, така че остарял таб не може да възстанови частично вече изтрит казус. Временният JSON за имотна активация вече е вътре в `.property-candidate-*` и се почиства със същата транзакция.
+- Премахването на RMS/OpenAI credentials изчиства Streamlit widget state при следващото изпълнение и не записва в вече създаден widget. Невалиден `final.json` се означава като нуждаещ се от преглед, а не като прегледан.
+- Грешки при четене или запис на локалните настройки се показват възстановимо в UI. Броят договори до казуса включва само bundle-и с валиден manifest, валиден `ContractInput` и съвпадащи SHA-256 хешове. Draft-овете, които вече не съвпадат с активната самоличност или нотариален provenance, се отделят ясно като исторически.
+- Споделеният PaddleOCR pipeline има вътрешно заключване и не изпълнява едновременно inference от различни Streamlit tabs. RMS изчиства cookie overlay преди всяко действие на dashboard-а.
+- Windows build-ът проверява content manifest за точните три OCR модела и единствената Chromium ревизия; download metadata и машинно-специфичните browser links не влизат в bundle-а.
+- Фирменото зелено за H1 вече покрива изискването за контраст. Тестове: 214 успешни.
+
 ## Актуализация 2026-08-31
 
+- Windows build-ът вече пресъздава чиста Python 3.11 среда от точно фиксиран lock файл, валидира всички задължителни шаблони/OCR модели/Chromium и единствения OpenCV provider преди PyInstaller и прекъсва при липса или конфликт.
+- Записаните казуси могат да се отворят отново след рестарт. Одобрената самоличност и имотният OCR се възстановяват от валидирани JSON записи, а стар договор се предлага за download само при съвпадащи manifest, input и DOCX хешове. Непълен нов OCR опит се почиства автоматично; постоянното изтриване от UI изисква потвърждение.
+- RMS непозната страница винаги остава `needs_review`, а readiness проверката изисква адресен компонент извън населеното място, като допуска село със самостоятелен номер. Статусът вече казва точно, че крайната оценка не е изпратена, защото worker-ът натиска **Next** между поддържаните секции.
+- Upload лимитът е 25 MB едновременно на Streamlit transport и storage границата. Desktop launcher-ът може да поеме заключването, ако първата инстанция прекъсне по време на startup. Интерактивното зелено използва по-тъмен достъпен вариант на фирмената палитра.
+- Desktop launcher-ът държи cross-process file lock за целия живот на сървъра. Само собственикът възстановява stale status; второ стартиране чака действителен health до 120 секунди и не може да изтрие чужд status.
+- Локалните RMS/OpenAI настройки round-trip-ват пароли и ключове със spaces, `#`, quotes, backslashes и `${...}` без dotenv интерполация.
+- Packaged OCR и browser пътищата се налагат от включените assets и не могат случайно да бъдат подменени от външни environment променливи.
+- Всеки bundle минава автоматичен frozen gate: реално OCR inference с пакетирания Paddle/PaddleX metadata, старт на включения Chromium, рендериране на Streamlit, **Exit application** и липса на stale status. Uninstaller-ът премахва програмните файлове.
 - RMS използва единна проверка за готовност както в интерфейса, така и непосредствено преди worker-а: изискват се всички полета за трите поддържани страници, бъдеща дата на издаване се отхвърля, а изтекла лична карта не може да стартира браузърна сесия.
-- Докато RMS worker-ът на текущия казус е активен, не може да се започне извличане на нова самоличност и да се изгуби контекстът на отворения браузър.
+- Докато RMS worker-ът на даден казус е активен, записаната самоличност на същия казус не може да се редактира или изтрие. Други казуси могат да се качват, извличат и отварят независимо.
 - Нов или сменен имотен документ първо се обработва в временна staging директория. Старият активен източник, OCR резултат и страници се архивират едва след успешно рендериране, OCR и избрания локален/AI анализ.
 - Ако всички кандидати за място на раждане са всъщност адресен шум, parser-ът връща празна стойност за ръчен преглед, вместо да прекъсва цялото извличане.
 - Генерирането на договор с нотариален източник вече проверява непосредствено преди рендериране, че активният файл е точно записаният `property-document.*` и че SHA-256 хешът му съвпада с извличането. Липсващ, подменен или променен файл спира операцията.
@@ -13,18 +39,18 @@
 - RMS launcher-ът сравнява показаната самоличност със записания `final.json`, подава на отделния worker само SHA-256 на snapshot-а и worker-ът проверява същите байтове и валидност преди отваряне на браузър.
 - При избор `НЕ` за изпращане на уведомлението по email полето се изчиства и не използва скрит fallback към контактния email.
 - RMS dropdown полетата различават placeholder стойности като `-` от реално въведени стойности и избират по видим етикет, независимо от вътрешната HTML стойност.
-- Населеното място се отчита като попълнено само след избор на видимо autocomplete предложение; иначе остава ясно означено за ръчен преглед.
+- Населеното място се въвежда с реални клавишни събития, за да може RMS да създаде задължителното поле `transliterate_populated_place[]`; продължаване е разрешено само ако кирилската и генерираната латинска стойност описват едно и също населено място и вид (`гр.`/`с.`).
 - Адресният parser приема съкратени и пълни български означения, със или без интервал след точката, и не губи областта при наличие и на община.
 - OpenAI резултатите се отхвърлят, ако стойността не е текстово подкрепена от цитираните OCR редове.
 - Локалният POC няма блокиращи approval контроли. Договорният вход честно записва, че няма операторско одобрение или потвърждение на предупрежденията.
 - Повторното категоризиране на OCR инвалидира стария `final.json`, за да не може RMS да използва остарял snapshot.
 - При активен RMS browser самоличността не може да се редактира или записва повторно, а конфликтно запазено поле спира автоматичното преминаване към следващата страница.
-- RMS различава `гр.` от `с.` при autocomplete; селски адрес без улица запазва и самостоятелен номер на къща.
+- RMS различава `гр.` от `с.` при проверката на транслитерацията; селски адрес без улица запазва и самостоятелен номер на къща.
 - Проверката за продавач изисква собственото и фамилното име да са точни и подредени в малък съседен OCR регион, вместо да комбинира имена на различни лица.
 - AI числата съвпадат като цели OCR tokens, а описанието не може да пропуска tokens, да цитира несъседни OCR редове или да бъде по-кратко от независимо ограничената от локалния parser имотна клауза.
 - AI структурираните стойности вече изискват точни tokens в изходния ред; сходни, но различни думи и пренаредени кадастрални части се отхвърлят. Цитираните редове за описанието трябва да съвпадат точно и в същия ред с локално ограничената клауза.
 - Описание, започващо след `:` на същия ред като маркера, запазва този ред като доказателство. Локалното предупреждение за вероятно непълна клауза се пренася и при AI режим.
-- Вече приета RMS autocomplete стойност се проверява повторно спрямо актуалния одобрен адрес; конфликтът се запазва за ръчен преглед и спира преминаването напред.
+- Вече попълнена RMS двойка населено място/транслитерация се проверява повторно спрямо актуалния одобрен адрес; конфликтът се запазва за ръчен преглед и спира преминаването напред.
 - Номерът на поддържаната българска лична карта е точно 9 цифри. Адрес без улица се приема както за село, така и за град, когато има достатъчно структурни компоненти.
 - Числовата офертна цена е единственият източник на истина: POC приема положителни цели евро до 999 999 999 и генерира детерминирано българския текст за договора.
 
@@ -34,9 +60,9 @@ Use the following prompt to continue development on another machine:
 Continue development of YavlenaKYCManager, a local single-user Python/Streamlit application for processing Bulgarian identity documents.
 
 Repository state:
-- Contract-generation and property-OCR work is currently uncommitted on top of commit 8e20aed.
+- Contract-generation, RMS, and Windows-packaging work is currently uncommitted on top of commit 9c1133a.
 - Python 3.11 remains recommended.
-- Tests: 141 passing, including RMS completeness/expiry/future-date enforcement, live-worker case locking, staged property replacement success/failure, birthplace-noise recovery, immutable RMS snapshot checks, contract-boundary identity validation, exact active-property source checks, monotonic local/AI warnings, and ordered exact AI grounding.
+- Tests: 218 passing, including еднократно RMS подаване, автоматично преминаване през контакт и представител, защита от повторно подаване при неясен резултат, current/historical contract classification, serialized shared OCR inference, pre-navigation RMS overlay dismissal, release-asset content hashes, identity-snapshot compare-and-swap, under-lock case revalidation, recoverable property-record staging, settings I/O recovery, verified-only draft counts, shared case-bound identity validation, stale-review rejection, contract/property identity enforcement, invalid-review labelling, abandoned property-candidate cleanup, safe credential-widget reset, full identity-OCR locking, legacy/stale approval rejection, interrupted lifecycle cleanup, cross-tab case mutation locking, credential removal and concurrent settings preservation, RMS completeness/expiry/future-date enforcement, unsupported-stage rejection, meaningful-address readiness, live-worker case locking, staged property replacement success/failure, recovered-contract hash validation, birthplace-noise recovery, immutable RMS snapshot checks, contract-boundary identity validation, exact active-property source checks, monotonic local/AI warnings, ordered exact AI grounding, packaged resource enforcement, exclusive desktop locking/readiness/status ownership and recovery, locale-independent contract dates, and frozen RMS-worker dispatch.
 
 Implemented:
 - Separate front and back ID uploads: JPEG, PNG, or PDF.
@@ -68,7 +94,10 @@ Implemented:
 - Parser safety limits produce explicit incomplete-description warnings instead of silent truncation.
 - A replacement property document archives the previous source, OCR record, and processed pages instead of requiring a new identity case.
 - A visible RMS worker logs in from the local `.env`, navigates to the physical-person profile, and fills saved ID fields. It is independent of contract generation; both branches start from the saved identity snapshot.
-- RMS automation advances through identity and identification-document pages, fills the address page, then stops before contact data, risk questions, assessment submission, or PDF retrieval.
+- RMS автоматизацията преминава през идентификационните данни, документа и адреса; приема предупреждението за непълни данни; отбелязва липса на контактни данни; оставя представителя неизбран; потвърждава и подава оценката еднократно. При неясно потвърждение не прави автоматичен повторен опит и оставя браузъра отворен за проверка.
+- В текущия RMS layout след страницата за представител се показва финален warning modal. Бутонът `Съгласявам се и продължавам` е еднократното действие за изпращане/изразходване на оценка; автоматизацията не търси втори submit след него и не го натиска повторно при неясен резултат.
+- Страницата с резултата се потвърждава и чрез наличието на `Свали справките в PDF`. Worker-ът улавя download-а, записва го атомарно като `output/rms-assessment.pdf`, проверява `%PDF-` signature, размер и SHA-256 и публикува метаданните в RMS status. UI показва quick download само при пълно съвпадение; подменен или липсващ файл не се предлага.
+- След еднократен опит за RMS подаване същият казус не може да стартира нова оценка, включително ако PDF download-ът е неуспешен. Това предотвратява дублиране; при неуспешен download се използва оставената отворена RMS страница.
 - cases/, .local/, .venv/, credentials, and browser sessions are Git-ignored.
 
 Run:
@@ -124,5 +153,5 @@ Before further changes:
 - Кандидатът за имотен документ се обработва извън активните артефакти и се активира с компенсиращо връщане при грешка. Старият валиден набор остава използваем, ако някое преместване не успее.
 
 Recommended next task:
-Run an operator-led end-to-end pilot with authorized buyer and seller cases, verify every RMS-prefilled field before continuing manually, compare generated DOCX drafts with manually completed contracts, and tune the deed parser against additional authorized notarial layouts.
+Run an operator-led end-to-end pilot from the packaged Windows installer with authorized buyer and seller cases, verify every RMS-prefilled field before continuing manually, compare generated DOCX drafts with manually completed contracts, and then validate the installer on clean Windows 10/11 x64 machines.
 ```

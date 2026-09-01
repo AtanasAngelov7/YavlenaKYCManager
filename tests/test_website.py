@@ -1,37 +1,58 @@
+import base64
 import hashlib
-from datetime import date
+import json
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pymupdf
 import pytest
+from dotenv import dotenv_values
 from playwright.sync_api import sync_playwright
 
-from models import PersonalDocument
-from storage import write_json
+from models import ApprovedIdentitySnapshot, ExtractionResult, PersonalDocument
+from storage import file_sha256, write_json
 from website import (
     RMS_ADDRESS_FIELD_SPECS,
     RMS_CHROMIUM_LAUNCH_ARGS,
     RMS_DOCUMENT_FIELD_SPECS,
     RMS_FIELD_SPECS,
     RMS_INITIAL_FIELD_SPECS,
+    RMS_PDF_FILENAME,
+    RMS_STATUS_FILENAME,
     RmsCredentials,
     WebsiteAutomationError,
     WebsiteNotConfiguredError,
     bulgarian_address_field_values,
+    force_close_rms_automation,
     identity_field_values,
     launch_rms_automation,
     load_rms_credentials,
     read_rms_status,
+    remove_rms_credentials,
     rms_identity_issues,
     rms_status_is_active,
+    rms_stop_request_is_pending,
     rms_worker_is_active,
+    request_rms_automation_stop,
+    save_rms_credentials,
     sex_from_egn,
     settlement_from_address,
     _advance_to_address_section,
     _advance_to_document_section,
+    _complete_remaining_rms_pages,
+    _download_rms_pdf,
     _fill_identity_fields,
     _launch_visible_rms_browser,
     _read_validated_identity_snapshot,
+    _release_rms_lock,
+    _rms_browser_session_is_open,
+    _rms_stop_requested,
+    _rms_stage_state,
+    _transliterated_settlement_is_valid,
+    _validate_rms_pdf_file,
+    _wait_for_submission_confirmation,
+    validated_rms_pdf_path,
 )
 
 
@@ -52,6 +73,25 @@ def _rms_ready_document(**changes: str) -> PersonalDocument:
     return document.model_copy(update=changes)
 
 
+def _write_approved_identity(case_root: Path, document: PersonalDocument) -> Path:
+    extraction_path = case_root / "extracted.json"
+    write_json(
+        extraction_path,
+        ExtractionResult(case_id=case_root.name, document=document).model_dump(mode="json"),
+    )
+    final_json = case_root / "final.json"
+    write_json(
+        final_json,
+        ApprovedIdentitySnapshot(
+            case_id=case_root.name,
+            extracted_sha256=file_sha256(extraction_path),
+            document=document,
+            approved_at=datetime.now(timezone.utc),
+        ).model_dump(mode="json"),
+    )
+    return final_json
+
+
 def test_rms_browser_disables_notification_prompts() -> None:
     captured: dict[str, object] = {}
 
@@ -70,6 +110,38 @@ def test_rms_browser_disables_notification_prompts() -> None:
         "args": list(RMS_CHROMIUM_LAUNCH_ARGS),
     }
     assert "--disable-notifications" in captured["args"]
+
+
+def test_rms_dashboard_clears_overlays_before_navigation_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from website import _open_individual_client_profile
+
+    events: list[str] = []
+
+    class Page:
+        def goto(self, url: str, **_options) -> None:
+            events.append(f"goto:{url}")
+
+    monkeypatch.setattr(
+        "website._dismiss_cookie_consent",
+        lambda _page: events.append("dismiss"),
+    )
+    monkeypatch.setattr(
+        "website._click_named",
+        lambda _page, text: events.append(f"click:{text}"),
+    )
+
+    _open_individual_client_profile(Page())
+
+    assert events == [
+        "goto:https://rms.bg/dashboard",
+        "dismiss",
+        "click:Направи оценка",
+        "dismiss",
+        "click:Рисков профил на клиент - физическо лице",
+        "dismiss",
+    ]
 
 
 def test_rms_credentials_load_from_local_env(
@@ -101,6 +173,64 @@ def test_rms_credentials_are_required(
 
     with pytest.raises(WebsiteNotConfiguredError, match="RMS_EMAIL, RMS_PASSWORD"):
         load_rms_credentials(tmp_path / "missing.env")
+
+
+def test_rms_credentials_can_be_saved_without_erasing_openai_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RMS_EMAIL", raising=False)
+    monkeypatch.delenv("RMS_PASSWORD", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text("OPENAI_API_KEY=synthetic-openai-key\n", encoding="utf-8")
+
+    saved = save_rms_credentials(
+        "operator@example.test",
+        "synthetic-rms-password",
+        env_path,
+    )
+
+    values = dotenv_values(env_path, interpolate=False)
+    assert saved.email == "operator@example.test"
+    assert values["OPENAI_API_KEY"] == "synthetic-openai-key"
+    assert values["RMS_EMAIL"] == "operator@example.test"
+    assert values["RMS_PASSWORD"] == "synthetic-rms-password"
+
+
+def test_rms_password_round_trips_dotenv_special_characters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RMS_EMAIL", raising=False)
+    monkeypatch.delenv("RMS_PASSWORD", raising=False)
+    env_path = tmp_path / ".env"
+    password = "  secret # part \\ with 'quotes' and ${NAME}  "
+
+    save_rms_credentials("operator@example.test", password, env_path)
+    monkeypatch.delenv("RMS_EMAIL", raising=False)
+    monkeypatch.delenv("RMS_PASSWORD", raising=False)
+
+    assert load_rms_credentials(env_path).password == password
+
+
+def test_rms_credentials_can_be_removed_without_erasing_openai_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RMS_EMAIL", raising=False)
+    monkeypatch.delenv("RMS_PASSWORD", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "RMS_EMAIL=operator@example.test\nRMS_PASSWORD=secret\nOPENAI_API_KEY=keep\n",
+        encoding="utf-8",
+    )
+
+    remove_rms_credentials(env_path)
+
+    values = dotenv_values(env_path, interpolate=False)
+    assert "RMS_EMAIL" not in values
+    assert "RMS_PASSWORD" not in values
+    assert values["OPENAI_API_KEY"] == "keep"
 
 
 def test_identity_field_values_use_only_the_approved_snapshot() -> None:
@@ -272,8 +402,9 @@ def test_rms_advances_and_fills_document_and_address_pages() -> None:
             <section id="addressSection" style="display:none">
               <select name="address_type[]"><option value=""></option><option>Постоянен</option></select>
               <select name="address_country[]"><option value=""></option><option>България</option></select>
-              <input name="populated_place[]"><div role="option"
-                onclick="document.querySelector('[name=&quot;populated_place[]&quot;]').value='гр. София'">гр. София</div>
+              <input name="populated_place[]"
+                onkeyup="transliteratedPlace.value = this.value ? 'Gr. Sofia' : ''">
+              <input id="transliteratedPlace" name="transliterate_populated_place[]">
               <input name="address_province[]">
               <input name="address_street[]"><input name="address_number[]">
               <input name="address_neighborhood[]"><input name="address_block[]">
@@ -322,6 +453,294 @@ def test_rms_advances_and_fills_document_and_address_pages() -> None:
         browser.close()
 
 
+def test_rms_completes_contact_representative_and_final_submission_pages() -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(
+            """
+            <section id="address">
+              <button id="next_btn" type="button"
+                onclick="address.style.display='none'; warning.style.display='block'">Напред</button>
+            </section>
+            <section id="warning" style="display:none">
+              <button type="button"
+                onclick="warning.style.display='none'; contacts.style.display='block'">
+                Съгласявам се и продължавам
+              </button>
+            </section>
+            <section id="contacts" style="display:none">
+              <label><input id="no-contact" type="checkbox">Няма данни / Не е представен</label>
+              <button id="next_btn" type="button"
+                onclick="contacts.style.display='none'; representatives.style.display='block'">
+                Напред
+              </button>
+            </section>
+            <section id="representatives" style="display:none">
+              <label><input id="representative" type="checkbox">
+                Клиентът се представлява от пълномощник или законен представител
+                (попечител/настойник), или друг представляващ
+              </label>
+              <button id="next_btn" type="button"
+                onclick="representatives.style.display='none'; finalPage.style.display='block'">
+                Напред
+              </button>
+            </section>
+            <section id="finalPage" style="display:none">
+              <label><input id="final-confirmation" type="checkbox">
+                Потвърждавам, че данните за оценката са верни
+              </label>
+              <button type="button" onclick="
+                finalPage.style.display='none'; success.style.display='block'">
+                Потвърди и изпрати данните
+              </button>
+            </section>
+            <section id="success" style="display:none">
+              Оценката е създадена успешно. Оценка № TEST-1234
+            </section>
+            """
+        )
+
+        result = _complete_remaining_rms_pages(page)
+
+        assert result.confirmed is True
+        assert result.submission_attempted is True
+        assert result.reference == "TEST-1234"
+        assert result.blockers == ()
+        assert page.locator("#no-contact").is_checked()
+        assert not page.locator("#representative").is_checked()
+        assert page.locator("#final-confirmation").is_checked()
+        assert result.completed_steps == (
+            "incomplete-data warning accepted",
+            "no contact details selected",
+            "representative left unselected",
+            "final declaration confirmed",
+            "final submission clicked",
+            "RMS submission confirmed",
+        )
+        browser.close()
+
+
+def test_rms_current_final_warning_is_the_only_submission_click() -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(
+            """
+            <script>let submissions = 0;</script>
+            <section id="address">
+              <button id="next_btn" type="button"
+                onclick="address.style.display='none'; contacts.style.display='block'">Напред</button>
+            </section>
+            <section id="contacts" style="display:none">
+              <label><input type="checkbox">Няма данни / Не е представен</label>
+              <button id="next_btn" type="button"
+                onclick="contacts.style.display='none'; representatives.style.display='block'">Напред</button>
+            </section>
+            <section id="representatives" style="display:none">
+              <label><input type="checkbox">
+                Клиентът се представлява от пълномощник или законен представител
+              </label>
+              <button id="next_btn" type="button"
+                onclick="representatives.style.display='none'; warning.style.display='block'">Напред</button>
+            </section>
+            <section id="warning" style="display:none">
+              <button type="button" onclick="
+                submissions += 1; warning.style.display='none'; success.style.display='block'">
+                Съгласявам се и продължавам
+              </button>
+            </section>
+            <section id="success" style="display:none">
+              Оценката е създадена успешно. Оценка № LIVE-1234
+            </section>
+            """
+        )
+
+        result = _complete_remaining_rms_pages(page)
+
+        assert result.confirmed is True
+        assert result.submission_attempted is True
+        assert page.evaluate("submissions") == 1
+        assert "final warning confirmed and submission clicked" in result.completed_steps
+        assert "final submission clicked" not in result.completed_steps
+        browser.close()
+
+
+def test_rms_pdf_action_is_positive_submission_evidence() -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content("<button>Свали справките в PDF</button>")
+
+        confirmed, reference = _wait_for_submission_confirmation(
+            page,
+            original_url=page.url,
+            timeout_ms=100,
+        )
+
+        assert confirmed is True
+        assert reference == ""
+        browser.close()
+
+
+def test_rms_pdf_is_downloaded_case_bound_and_integrity_checked(tmp_path: Path) -> None:
+    case_root = tmp_path / "case-1"
+    output = case_root / "output"
+    output.mkdir(parents=True)
+    status_path = case_root / RMS_STATUS_FILENAME
+    with pymupdf.open() as document:
+        document.new_page()
+        pdf_payload = document.tobytes()
+    encoded_pdf = base64.b64encode(pdf_payload).decode("ascii")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(
+            f"""
+            <button onclick="
+              const link = document.createElement('a');
+              link.href = 'data:application/pdf;base64,{encoded_pdf}';
+              link.download = 'server-provided-name.pdf';
+              link.click();
+            ">Свали справките в PDF</button>
+            """
+        )
+
+        artifact = _download_rms_pdf(page, status_path)
+
+        browser.close()
+
+    pdf_path = output / RMS_PDF_FILENAME
+    status = {
+        "submission_confirmed": True,
+        "pdf_downloaded": True,
+        "rms_pdf_filename": artifact.filename,
+        "rms_pdf_sha256": artifact.sha256,
+        "rms_pdf_size": artifact.size,
+    }
+    assert artifact.filename == RMS_PDF_FILENAME
+    assert pdf_path.read_bytes().startswith(b"%PDF-")
+    assert artifact.sha256 == file_sha256(pdf_path)
+    assert validated_rms_pdf_path(case_root, status) == pdf_path.resolve()
+
+    pdf_path.write_bytes(b"%PDF-tampered")
+
+    with pytest.raises(WebsiteAutomationError, match="integrity validation"):
+        validated_rms_pdf_path(case_root, status)
+
+
+def test_rms_pdf_validation_rejects_metadata_without_confirmed_submission(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-1"
+    output = case_root / "output"
+    output.mkdir(parents=True)
+    pdf_path = output / RMS_PDF_FILENAME
+    with pymupdf.open() as document:
+        document.new_page()
+        pdf_path.write_bytes(document.tobytes())
+    status = {
+        "submission_confirmed": False,
+        "pdf_downloaded": True,
+        "rms_pdf_filename": RMS_PDF_FILENAME,
+        "rms_pdf_sha256": file_sha256(pdf_path),
+        "rms_pdf_size": pdf_path.stat().st_size,
+    }
+
+    with pytest.raises(WebsiteAutomationError, match="metadata is invalid"):
+        validated_rms_pdf_path(case_root, status)
+
+
+def test_rms_pdf_validation_rejects_a_header_only_file(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "truncated.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    with pytest.raises(WebsiteAutomationError, match="readable PDF"):
+        _validate_rms_pdf_file(pdf_path)
+
+
+def test_rms_preserves_an_unexpected_selected_representative_for_review() -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(
+            """
+            <section id="address">
+              <button id="next_btn" type="button"
+                onclick="address.style.display='none'; contacts.style.display='block'">Напред</button>
+            </section>
+            <section id="contacts" style="display:none">
+              <label><input id="no-contact" type="checkbox">Няма данни / Не е представен</label>
+              <button id="next_btn" type="button"
+                onclick="contacts.style.display='none'; representatives.style.display='block'">
+                Напред
+              </button>
+            </section>
+            <section id="representatives" style="display:none">
+              <label><input id="representative" type="checkbox" checked>
+                Клиентът се представлява от пълномощник или законен представител
+              </label>
+            </section>
+            """
+        )
+
+        result = _complete_remaining_rms_pages(page)
+
+        assert result.confirmed is False
+        assert result.submission_attempted is False
+        assert "unexpectedly selected" in result.blockers[0]
+        assert page.locator("#representative").is_checked()
+        browser.close()
+
+
+def test_rms_never_retries_an_unconfirmed_final_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "website._wait_for_submission_confirmation",
+        lambda *args, **kwargs: (False, ""),
+    )
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(
+            """
+            <script>let submissions = 0;</script>
+            <section id="address">
+              <button id="next_btn" type="button"
+                onclick="address.style.display='none'; contacts.style.display='block'">Напред</button>
+            </section>
+            <section id="contacts" style="display:none">
+              <label><input type="checkbox">Няма данни / Не е представен</label>
+              <button id="next_btn" type="button"
+                onclick="contacts.style.display='none'; representatives.style.display='block'">
+                Напред
+              </button>
+            </section>
+            <section id="representatives" style="display:none">
+              <label><input type="checkbox">
+                Клиентът се представлява от пълномощник или законен представител
+              </label>
+              <button id="next_btn" type="button"
+                onclick="representatives.style.display='none'; finalPage.style.display='block'">
+                Напред
+              </button>
+            </section>
+            <section id="finalPage" style="display:none">
+              <button type="button" onclick="submissions += 1">Изпрати данните</button>
+            </section>
+            """
+        )
+
+        result = _complete_remaining_rms_pages(page)
+
+        assert result.confirmed is False
+        assert result.submission_attempted is True
+        assert page.evaluate("submissions") == 1
+        assert result.blockers == ("RMS submission confirmation could not be verified",)
+        browser.close()
+
+
 def test_rms_replaces_dash_placeholders_and_selects_by_visible_label() -> None:
     document = PersonalDocument(
         document_number="123456789",
@@ -354,7 +773,13 @@ def test_rms_replaces_dash_placeholders_and_selects_by_visible_label() -> None:
         browser.close()
 
 
-def test_rms_does_not_report_uncommitted_settlement_as_filled() -> None:
+def test_rms_does_not_report_missing_transliteration_as_filled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "website._wait_for_transliterated_settlement",
+        lambda *args, **kwargs: False,
+    )
     document = PersonalDocument(address="гр. София, ул. Топли дол 2Б")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -379,28 +804,26 @@ def test_rms_does_not_report_uncommitted_settlement_as_filled() -> None:
         )
 
         assert "residence settlement" not in filled
-        assert "residence settlement (autocomplete selection requires review)" in unmatched
+        assert "residence settlement (RMS transliteration requires review)" in unmatched
         assert (
             page.locator("input[name='populated_place[]']").get_attribute(
-                "data-yavlena-autocomplete-attempted"
+                "data-yavlena-transliteration-attempted"
             )
             == "true"
         )
         browser.close()
 
 
-def test_rms_autocomplete_selects_the_matching_locality_not_the_first_result() -> None:
+def test_rms_types_locality_and_verifies_the_generated_transliteration() -> None:
     document = PersonalDocument(address="гр. София, ул. Топли дол 2Б")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         page.set_content(
             """
-            <input name="populated_place[]">
-            <div role="option"
-              onclick="document.querySelector('[name=&quot;populated_place[]&quot;]').value='гр. Пловдив'">гр. Пловдив</div>
-            <div role="option"
-              onclick="document.querySelector('[name=&quot;populated_place[]&quot;]').value='Gr. Sofia'">Gr. Sofia</div>
+            <input name="populated_place[]"
+              onkeyup="transliteratedPlace.value = this.value ? 'Gr. Sofia' : ''">
+            <input id="transliteratedPlace" name="transliterate_populated_place[]">
             """
         )
         settlement_spec = tuple(
@@ -414,70 +837,58 @@ def test_rms_autocomplete_selects_the_matching_locality_not_the_first_result() -
             include_country_defaults=False,
         )
 
-        assert page.locator("input[name='populated_place[]']").input_value() == "Gr. Sofia"
+        assert page.locator("input[name='populated_place[]']").input_value() == "гр. София"
+        assert (
+            page.locator("input[name='transliterate_populated_place[]']").input_value()
+            == "Gr. Sofia"
+        )
         assert filled == ["residence settlement"]
         assert unmatched == []
         browser.close()
 
 
-def test_rms_autocomplete_leaves_ambiguous_matching_localities_for_review() -> None:
-    document = PersonalDocument(address="гр. София, ул. Топли дол 2Б")
+def test_rms_rejects_a_mismatched_locality_transliteration() -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         page.set_content(
             """
-            <input name="populated_place[]">
-            <div role="option">гр. София</div>
-            <div role="option">Gr. Sofia</div>
+            <input name="populated_place[]" value="гр. София">
+            <input name="transliterate_populated_place[]" value="Gr. Plovdiv">
             """
         )
-        settlement_spec = tuple(
-            spec for spec in RMS_ADDRESS_FIELD_SPECS if spec.key == "settlement"
-        )
+        target = page.locator("input[name='populated_place[]']")
 
-        filled, unmatched = _fill_identity_fields(
+        assert _transliterated_settlement_is_valid(
             page,
-            document,
-            specs=settlement_spec,
-            include_country_defaults=False,
-        )
-
-        assert "residence settlement" not in filled
-        assert "residence settlement (autocomplete selection requires review)" in unmatched
+            target,
+            "гр. София",
+        ) is False
         browser.close()
 
 
-def test_rms_autocomplete_does_not_change_a_village_into_a_city() -> None:
-    document = PersonalDocument(address="с. Банкя, № 12")
+def test_rms_transliteration_does_not_change_a_village_into_a_city() -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         page.set_content(
             """
-            <input name="populated_place[]">
-            <div role="option"
-              onclick="document.querySelector('[name=&quot;populated_place[]&quot;]').value='гр. Банкя'">гр. Банкя</div>
+            <input name="populated_place[]" value="с. Банкя">
+            <input name="transliterate_populated_place[]" value="Gr. Bankya">
             """
         )
-        settlement_spec = tuple(
-            spec for spec in RMS_ADDRESS_FIELD_SPECS if spec.key == "settlement"
-        )
+        target = page.locator("input[name='populated_place[]']")
 
-        filled, unmatched = _fill_identity_fields(
+        assert _transliterated_settlement_is_valid(
             page,
-            document,
-            specs=settlement_spec,
-            include_country_defaults=False,
-        )
-
-        assert filled == []
-        assert "residence settlement (autocomplete selection requires review)" in unmatched
+            target,
+            "с. Банкя",
+        ) is False
         assert page.locator("input[name='populated_place[]']").input_value() == "с. Банкя"
         browser.close()
 
 
-def test_rms_revalidates_a_previously_committed_autocomplete_value() -> None:
+def test_rms_revalidates_a_previously_verified_transliteration_value() -> None:
     document = PersonalDocument(address="гр. София, ул. Примерна 1")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -485,7 +896,8 @@ def test_rms_revalidates_a_previously_committed_autocomplete_value() -> None:
         page.set_content(
             """
             <input name="populated_place[]" value="гр. Пловдив"
-              data-yavlena-autocomplete-committed="true">
+              data-yavlena-transliteration-verified="true">
+            <input name="transliterate_populated_place[]" value="Gr. Plovdiv">
             """
         )
         settlement_spec = tuple(
@@ -571,7 +983,7 @@ def test_launcher_uses_the_approved_file_without_credentials_in_command(
     case_root.mkdir()
     final_json = case_root / "final.json"
     document = _rms_ready_document()
-    write_json(final_json, document.model_dump(mode="json"))
+    _write_approved_identity(case_root, document)
     credentials = RmsCredentials(
         email="operator@example.test",
         password="synthetic-secret",
@@ -598,6 +1010,32 @@ def test_launcher_uses_the_approved_file_without_credentials_in_command(
     assert status["pid"] == 4321
 
 
+def test_frozen_launcher_routes_worker_arguments_through_the_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_root = tmp_path / "2026-08-29_frozen"
+    case_root.mkdir()
+    final_json = case_root / "final.json"
+    document = _rms_ready_document()
+    _write_approved_identity(case_root, document)
+    captured: list[str] = []
+    monkeypatch.setattr(
+        "website.load_rms_credentials",
+        lambda: RmsCredentials(email="operator@example.test", password="secret"),
+    )
+    monkeypatch.setattr("website.is_frozen", lambda: True)
+    monkeypatch.setattr(
+        "website.subprocess.Popen",
+        lambda command, **kwargs: captured.extend(command) or SimpleNamespace(pid=4321),
+    )
+
+    launch_rms_automation(final_json, case_root, document)
+
+    assert captured[1] == "--rms-worker"
+    assert not any(argument.endswith("website.py") for argument in captured)
+
+
 def test_launcher_rejects_a_snapshot_different_from_the_reviewed_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -607,7 +1045,7 @@ def test_launcher_rejects_a_snapshot_different_from_the_reviewed_values(
     final_json = case_root / "final.json"
     saved = _rms_ready_document()
     reviewed = saved.model_copy(update={"first_name": "ИВАЙЛО"})
-    write_json(final_json, saved.model_dump(mode="json"))
+    _write_approved_identity(case_root, saved)
     monkeypatch.setattr(
         "website.load_rms_credentials",
         lambda: RmsCredentials(email="operator@example.test", password="secret"),
@@ -630,7 +1068,7 @@ def test_launcher_rejects_an_invalid_identity_before_starting_a_browser(
         personal_number="0000000000",
         document_number="INVALID",
     )
-    write_json(final_json, invalid.model_dump(mode="json"))
+    _write_approved_identity(case_root, invalid)
     monkeypatch.setattr(
         "website.load_rms_credentials",
         lambda: RmsCredentials(email="operator@example.test", password="secret"),
@@ -659,6 +1097,30 @@ def test_rms_readiness_rejects_missing_and_temporally_invalid_values() -> None:
     assert any(issue.field == "issued_on" and "future" in issue.message for issue in future_issue)
 
 
+def test_rms_readiness_rejects_a_settlement_without_address_details() -> None:
+    issues = rms_identity_issues(
+        _rms_ready_document(address="гр. София"),
+        reference_date=date(2026, 8, 31),
+    )
+
+    assert any(issue.field == "address" and "in addition" in issue.message for issue in issues)
+
+
+def test_rms_readiness_allows_a_village_with_a_standalone_house_number() -> None:
+    issues = rms_identity_issues(
+        _rms_ready_document(address="с. Банкя, № 12"),
+        reference_date=date(2026, 8, 31),
+    )
+
+    assert not any(issue.field in {"address", "settlement"} for issue in issues)
+
+
+def test_unsupported_rms_stage_can_never_report_success() -> None:
+    assert _rms_stage_state("unsupported", []) == "needs_review"
+    assert _rms_stage_state("address", []) == "filled"
+    assert _rms_stage_state("address", ["Street"]) == "needs_review"
+
+
 def test_launcher_rejects_an_incomplete_rms_snapshot_before_starting_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -667,7 +1129,7 @@ def test_launcher_rejects_an_incomplete_rms_snapshot_before_starting_worker(
     case_root.mkdir()
     final_json = case_root / "final.json"
     incomplete = _rms_ready_document(address="")
-    write_json(final_json, incomplete.model_dump(mode="json"))
+    _write_approved_identity(case_root, incomplete)
     monkeypatch.setattr(
         "website.load_rms_credentials",
         lambda: RmsCredentials(email="operator@example.test", password="secret"),
@@ -689,7 +1151,7 @@ def test_rms_worker_snapshot_reader_rejects_changed_bytes(tmp_path: Path) -> Non
         personal_number="6101057509",
         document_number="123456789",
     )
-    write_json(final_json, document.model_dump(mode="json"))
+    _write_approved_identity(final_json.parent, document)
     original_hash = hashlib.sha256(final_json.read_bytes()).hexdigest()
     write_json(
         final_json,
@@ -698,6 +1160,41 @@ def test_rms_worker_snapshot_reader_rejects_changed_bytes(tmp_path: Path) -> Non
 
     with pytest.raises(WebsiteAutomationError, match="changed after RMS launch"):
         _read_validated_identity_snapshot(final_json, expected_sha256=original_hash)
+
+
+def test_rms_snapshot_rejects_a_review_record_copied_from_another_case(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first-case"
+    second_root = tmp_path / "second-case"
+    first_root.mkdir()
+    second_root.mkdir()
+    document = _rms_ready_document()
+    first_final = _write_approved_identity(first_root, document)
+    _write_approved_identity(second_root, document)
+    second_final = second_root / "final.json"
+    second_final.write_bytes(first_final.read_bytes())
+
+    with pytest.raises(WebsiteAutomationError, match="different case"):
+        _read_validated_identity_snapshot(second_final)
+
+
+def test_rms_snapshot_rejects_changed_ocr_evidence(tmp_path: Path) -> None:
+    case_root = tmp_path / "bound-case"
+    case_root.mkdir()
+    document = _rms_ready_document()
+    final_json = _write_approved_identity(case_root, document)
+    write_json(
+        case_root / "extracted.json",
+        ExtractionResult(
+            case_id=case_root.name,
+            document=document,
+            warnings=["changed after review"],
+        ).model_dump(mode="json"),
+    )
+
+    with pytest.raises(WebsiteAutomationError, match="changed after identity review"):
+        _read_validated_identity_snapshot(final_json)
 
 
 def test_stale_rms_status_does_not_block_a_new_session(
@@ -730,8 +1227,8 @@ def test_project_rms_lock_blocks_a_second_case_and_ui_session(
     document = _rms_ready_document()
     first_json = first_root / "final.json"
     second_json = second_root / "final.json"
-    write_json(first_json, document.model_dump(mode="json"))
-    write_json(second_json, document.model_dump(mode="json"))
+    _write_approved_identity(first_root, document)
+    _write_approved_identity(second_root, document)
 
     starts = 0
 
@@ -746,6 +1243,10 @@ def test_project_rms_lock_blocks_a_second_case_and_ui_session(
     )
     monkeypatch.setattr("website.subprocess.Popen", fake_popen)
     monkeypatch.setattr("website._process_is_running", lambda pid: pid == 4321)
+    monkeypatch.setattr(
+        "website._rms_worker_process_matches_lock",
+        lambda pid, lock_path, token: pid == 4321,
+    )
 
     launch_rms_automation(first_json, first_root, document)
 
@@ -753,6 +1254,117 @@ def test_project_rms_lock_blocks_a_second_case_and_ui_session(
     with pytest.raises(WebsiteAutomationError, match="already active"):
         launch_rms_automation(second_json, second_root, document)
     assert starts == 1
+
+
+def test_rms_stop_request_is_bound_to_the_active_lock_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases_root = tmp_path / "cases"
+    cases_root.mkdir()
+    lock_path = cases_root / ".rms-automation.lock"
+    write_json(lock_path, {"pid": 4321, "token": "current-token"})
+    monkeypatch.setattr("website._process_is_running", lambda pid: pid == 4321)
+    monkeypatch.setattr(
+        "website._rms_worker_process_matches_lock",
+        lambda pid, lock_path, token: pid == 4321 and token == "current-token",
+    )
+
+    assert request_rms_automation_stop(cases_root) is True
+    request = json.loads(
+        (cases_root / ".rms-automation.stop").read_text(encoding="utf-8")
+    )
+
+    assert request["token"] == "current-token"
+    assert request["requested_at"]
+    assert _rms_stop_requested(lock_path, "current-token") is True
+    assert _rms_stop_requested(lock_path, "different-token") is False
+    assert rms_stop_request_is_pending(cases_root) is True
+
+
+def test_force_close_rms_terminates_only_the_verified_worker_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases_root = tmp_path / "cases"
+    cases_root.mkdir()
+    lock_path = cases_root / ".rms-automation.lock"
+    stop_path = cases_root / ".rms-automation.stop"
+    write_json(
+        lock_path,
+        {"pid": 4321, "token": "current-token", "state": "worker"},
+    )
+    write_json(stop_path, {"token": "current-token"})
+    stopped: list[int] = []
+    monkeypatch.setattr(
+        "website._rms_worker_process_matches_lock",
+        lambda pid, candidate_lock, token: (
+            pid == 4321
+            and candidate_lock == lock_path
+            and token == "current-token"
+        ),
+    )
+    monkeypatch.setattr("website.terminate_process_tree", stopped.append)
+
+    assert force_close_rms_automation(cases_root) is True
+
+    assert stopped == [4321]
+    assert not lock_path.exists()
+    assert not stop_path.exists()
+
+
+def test_force_close_rms_refuses_an_unverified_live_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases_root = tmp_path / "cases"
+    cases_root.mkdir()
+    lock_path = cases_root / ".rms-automation.lock"
+    write_json(
+        lock_path,
+        {"pid": 4321, "token": "current-token", "state": "worker"},
+    )
+    monkeypatch.setattr(
+        "website._rms_worker_process_matches_lock",
+        lambda *args: False,
+    )
+    monkeypatch.setattr("website._process_is_running", lambda pid: pid == 4321)
+    monkeypatch.setattr(
+        "website.terminate_process_tree",
+        lambda pid: pytest.fail("an unverified PID must never be terminated"),
+    )
+
+    with pytest.raises(WebsiteAutomationError, match="could not be verified"):
+        force_close_rms_automation(cases_root)
+
+    assert lock_path.exists()
+
+
+def test_releasing_rms_lock_removes_only_its_matching_stop_request(tmp_path: Path) -> None:
+    cases_root = tmp_path / "cases"
+    cases_root.mkdir()
+    lock_path = cases_root / ".rms-automation.lock"
+    stop_path = cases_root / ".rms-automation.stop"
+    write_json(lock_path, {"pid": 4321, "token": "current-token"})
+    write_json(stop_path, {"token": "current-token"})
+
+    _release_rms_lock(lock_path, "current-token")
+
+    assert not lock_path.exists()
+    assert not stop_path.exists()
+
+
+def test_rms_browser_session_closes_when_the_visible_page_is_closed() -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        assert _rms_browser_session_is_open(browser, context, page) is True
+
+        page.close()
+
+        assert _rms_browser_session_is_open(browser, context, page) is False
 
 
 def test_one_rms_selector_failure_does_not_abort_other_field_review() -> None:

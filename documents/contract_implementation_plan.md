@@ -6,7 +6,7 @@ Last updated: 2026-08-29
 
 ## Goal
 
-Extend the local application so an operator can review OCR-derived identity and property data, correct it, approve it, and generate a Bulgarian brokerage-contract draft from a controlled Word template.
+Extend the local application so an operator can review OCR-derived identity and property data, correct and save it, and generate a Bulgarian brokerage-contract draft from a controlled Word template. A future controlled mode may add formal approval.
 
 The proof of concept supports exactly one buyer or one seller per case. OCR output is always a draft. A contract must never be generated directly from unreviewed OCR data.
 
@@ -18,7 +18,7 @@ The proof of concept supports exactly one buyer or one seller per case. OCR outp
 - The POC supports one natural person only. Multiple buyers, multiple sellers, legal entities, representatives, and powers of attorney are deferred.
 - Identity values come from the existing ID OCR and review workflow.
 - For a seller, the operator must explicitly choose either an uploaded notary document or manual property entry. A notary document is optional.
-- Uploaded notary-document values are OCR proposals only and require operator review. Manual entry carries an explicit source warning that must be acknowledged.
+- Uploaded notary-document values are OCR proposals only and require operator review. Manual entry carries an explicit persistent source warning; the local POC does not fabricate an acknowledgement event.
 - Buyer search criteria remain as manual blanks in the Word document for this POC. A later version may collect them in the UI.
 - Phone, email, contract date, commercial terms, agent details, and consent choices are manual or system-assisted fields; they must not be invented by OCR.
 - A mismatch or questionable property document does not prevent generation after the operator sees an explicit warning and confirms an override.
@@ -31,8 +31,8 @@ The proof of concept supports exactly one buyer or one seller per case. OCR outp
 2. Do not include personal values in filenames, logs, exception messages, or case identifiers.
 3. Keep the original upload, OCR draft, approved values, and generated output as separate artifacts.
 4. Do not silently populate uncertain fields. Leave them blank and show a warning.
-5. Require explicit identity approval before the contract stage.
-6. Require explicit property and contract-data approval before generation.
+5. Require a saved, reviewed identity snapshot before the contract stage.
+6. Record property warnings and contract inputs honestly; the local POC must not claim approval or acknowledgement that did not occur.
 7. Treat extracted deed information as transcription assistance, not a legal determination of ownership, validity, or encumbrances.
 8. Never overwrite an original contract template or a previously generated contract.
 9. Fail generation if a required template tag is missing, duplicated unexpectedly, or unresolved in the output.
@@ -41,7 +41,7 @@ The proof of concept supports exactly one buyer or one seller per case. OCR outp
 
 1. The operator uploads the front and back of an identity document.
 2. The application performs local OCR and displays the extracted identity values.
-3. The operator edits the values, compares them with the original, and approves them.
+3. The operator edits the values, compares them with the original, and saves the reviewed snapshot.
 4. The operator selects `Buyer` or `Seller`.
 5. The application displays the role-specific contract form.
    The approved full name, EGN, and identity-document number are shown read-only and are passed directly to the controlled template; the operator does not retype them.
@@ -49,9 +49,9 @@ The proof of concept supports exactly one buyer or one seller per case. OCR outp
 7. In the seller workflow, the operator chooses `Upload notary document` or `Enter property details manually`; neither path is preselected.
 8. For an upload, the application stores and hashes the source, renders it, performs OCR, classifies it, and proposes property values with page/region evidence. Generation remains disabled until processing succeeds.
 9. For manual entry, no property document is required, but the application displays a warning that every value must be checked against an authoritative source.
-10. The operator corrects and approves the property description and all manual contract fields.
-11. Warnings and identity/property-party mismatches are displayed. The operator must explicitly acknowledge any override.
-12. The application creates an immutable approved contract-input snapshot, including the selected property source and uploaded file name/hash when applicable.
+10. The operator corrects the property description and completes all manual contract fields.
+11. Warnings and identity/property-party mismatches remain displayed and are stored with the draft input.
+12. The application creates an immutable versioned POC contract-input snapshot, including the selected property source and uploaded file name/hash when applicable and explicit false approval fields.
 13. The selected controlled template is rendered into a new `.docx` draft.
 14. The application verifies the generated file, displays it for download, and records the template version used.
 
@@ -111,8 +111,8 @@ Suggested models:
 - `PropertyDocumentResult`: classification, OCR lines, proposed values, evidence, and warnings.
 - `PropertyDetails`: structured fields plus a full contract-ready description.
 - `ContractOptions`: date, price, term, agent details, consent choices, and warning override.
-- `ContractInput`: approved identity, role, contact, property/options, approval timestamp, and operator acknowledgement.
-- `ContractManifest`: approved-input hash, template name/hash, output filename/hash, and generation timestamp.
+- `ContractInput`: saved identity, role, contact, property/options, and explicit POC approval/acknowledgement state.
+- `ContractManifest`: contract-input hash, template name/hash, output filename/hash, and generation timestamp.
 
 ## Property-document extraction
 
@@ -187,10 +187,10 @@ PDF conversion is deferred until `.docx` generation is stable. It may later use 
 
 ### Phase 2: models and storage
 
-- [x] Add role, contact, contract-options, approved-input, and manifest models.
+- [x] Add role, contact, contract-options, versioned-input, and manifest models.
 - [x] Extend safe upload storage for one property document per seller case.
-- [x] Add atomic, versioned records for approved contract input and generation manifests.
-- [x] Persist the selected property source and uploaded notary-document filename/hash in the approved input.
+- [x] Add atomic, versioned records for contract input and generation manifests.
+- [x] Persist the selected property source and uploaded notary-document filename/hash in the versioned input.
 - [x] Prevent stale Streamlit contract state from crossing case or role boundaries.
 - [x] Bind seller property comparison to the approved identity and reset approvals between generated snapshots.
 
@@ -229,7 +229,7 @@ This phase should work with manually entered seller property data before deed OC
 - [x] Test missing/duplicate/unresolved template tags.
 - [x] Verify generation creates versioned drafts without overwriting earlier output.
 - [x] Reject unapproved template substitutions and inherited personal Word metadata.
-- [x] Hash the approved input snapshot in the generation manifest.
+- [x] Hash the contract-input snapshot in the generation manifest.
 - [ ] Compare generated files against manually completed reference contracts.
 - [ ] Run a limited pilot using only authorized documents.
 
@@ -244,7 +244,7 @@ The POC is complete when an operator can:
 5. See and explicitly acknowledge critical warnings.
 6. Generate the correct Bulgarian `.docx` contract without changing its controlled template.
 7. Open the draft and find no unresolved template tags.
-8. Trace the draft to an approved input snapshot and template version.
+8. Trace the draft to its versioned input snapshot and template version; POC approval fields remain explicitly false.
 
 The automated acceptance path is implemented. A final operator pilot with authorized documents remains required before production use.
 

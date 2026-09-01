@@ -11,14 +11,21 @@ import pytest
 from pydantic import ValidationError
 
 from bulgarian_numbers import bulgarian_integer_words
-from contracts import ContractGenerationError, TEMPLATE_BY_ROLE, generate_contract
+from contracts import (
+    ContractGenerationError,
+    TEMPLATE_BY_ROLE,
+    _format_bulgarian_date,
+    generate_contract,
+)
 from models import (
     AgentDetails,
+    ApprovedIdentitySnapshot,
     BinaryChoice,
     ContactDetails,
     ContractInput,
     ContractOptions,
     ContractRole,
+    ExtractionResult,
     PersonalDocument,
     PropertyDetailsSource,
     PropertyDocument,
@@ -32,6 +39,10 @@ from storage import write_json
 
 PROPERTY_SOURCE_BYTES = b"authorized synthetic property document"
 PROPERTY_SOURCE_SHA256 = hashlib.sha256(PROPERTY_SOURCE_BYTES).hexdigest()
+
+
+def test_bulgarian_date_formatting_is_locale_independent() -> None:
+    assert _format_bulgarian_date(date(2026, 8, 28)) == "28.08.2026 г."
 
 
 def _contract_input(case_id: str, role: ContractRole) -> ContractInput:
@@ -123,6 +134,24 @@ def _write_active_property_source(case_root: Path) -> None:
     )
 
 
+def _write_reviewed_identity(case_root: Path, client: PersonalDocument) -> None:
+    case_root.mkdir(parents=True, exist_ok=True)
+    extraction_path = case_root / "extracted.json"
+    write_json(
+        extraction_path,
+        ExtractionResult(case_id=case_root.name, document=client).model_dump(mode="json"),
+    )
+    write_json(
+        case_root / "final.json",
+        ApprovedIdentitySnapshot(
+            case_id=case_root.name,
+            extracted_sha256=hashlib.sha256(extraction_path.read_bytes()).hexdigest(),
+            document=client,
+            approved_at=datetime(2026, 8, 28, 11, tzinfo=timezone.utc),
+        ).model_dump(mode="json"),
+    )
+
+
 def _without_notary_provenance(options: ContractOptions) -> dict[str, object]:
     return {
         **options.model_dump(mode="python"),
@@ -142,8 +171,10 @@ def _without_notary_provenance(options: ContractOptions) -> dict[str, object]:
 def test_generate_buyer_contract_bundle(tmp_path: Path) -> None:
     case_id = "2026-08-28_120000_abc123"
     case_root = tmp_path / case_id
+    contract_input = _contract_input(case_id, ContractRole.BUYER)
+    _write_reviewed_identity(case_root, contract_input.client)
 
-    generated = generate_contract(_contract_input(case_id, ContractRole.BUYER), case_root)
+    generated = generate_contract(contract_input, case_root)
 
     assert generated.document_path.is_file()
     assert generated.input_path.is_file()
@@ -169,6 +200,19 @@ def test_generate_buyer_contract_bundle(tmp_path: Path) -> None:
     ).hexdigest()
 
 
+def test_generation_requires_the_current_reviewed_identity(tmp_path: Path) -> None:
+    contract_input = _contract_input("2026-08-28_120025_identity", ContractRole.BUYER)
+    case_root = tmp_path / contract_input.case_id
+
+    with pytest.raises(ContractGenerationError, match="reviewed identity is missing"):
+        generate_contract(contract_input, case_root)
+
+    changed_client = contract_input.client.model_copy(update={"first_name": "GEORGI"})
+    _write_reviewed_identity(case_root, changed_client)
+    with pytest.raises(ContractGenerationError, match="client differs"):
+        generate_contract(contract_input, case_root)
+
+
 def test_unreviewed_poc_generation_is_recorded_without_fabricated_approval(
     tmp_path: Path,
 ) -> None:
@@ -182,6 +226,7 @@ def test_unreviewed_poc_generation_is_recorded_without_fabricated_approval(
             "warnings_acknowledged": False,
         }
     )
+    _write_reviewed_identity(tmp_path / unreviewed.case_id, unreviewed.client)
 
     generated = generate_contract(unreviewed, tmp_path / unreviewed.case_id)
     stored_input = json.loads(generated.input_path.read_text(encoding="utf-8"))
@@ -195,8 +240,10 @@ def test_generate_seller_contract_uses_approved_property_text(tmp_path: Path) ->
     case_id = "2026-08-28_120100_def456"
     case_root = tmp_path / case_id
     _write_active_property_source(case_root)
+    contract_input = _contract_input(case_id, ContractRole.SELLER)
+    _write_reviewed_identity(case_root, contract_input.client)
 
-    generated = generate_contract(_contract_input(case_id, ContractRole.SELLER), case_root)
+    generated = generate_contract(contract_input, case_root)
 
     rendered = _word_xml_text(generated.document_path)
     assert "АПАРТАМЕНТ № 6" in rendered
@@ -218,6 +265,7 @@ def test_generate_seller_contract_uses_approved_property_text(tmp_path: Path) ->
 def test_seller_generation_requires_the_exact_active_property_source(tmp_path: Path) -> None:
     contract_input = _contract_input("2026-08-28_120150_source1", ContractRole.SELLER)
     case_root = tmp_path / contract_input.case_id
+    _write_reviewed_identity(case_root, contract_input.client)
 
     with pytest.raises(ContractGenerationError, match="no longer active"):
         generate_contract(contract_input, case_root)
@@ -234,6 +282,7 @@ def test_seller_generation_rejects_a_changed_property_extraction_record(tmp_path
     case_root = tmp_path / case_id
     contract_input = _contract_input(case_id, ContractRole.SELLER)
     _write_active_property_source(case_root)
+    _write_reviewed_identity(case_root, contract_input.client)
     record_path = case_root / "property_extracted.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["document"]["property_description"] = "changed after review"
@@ -247,6 +296,7 @@ def test_generation_never_overwrites_an_earlier_draft(tmp_path: Path) -> None:
     case_id = "2026-08-28_120200_ghi789"
     case_root = tmp_path / case_id
     contract_input = _contract_input(case_id, ContractRole.BUYER)
+    _write_reviewed_identity(case_root, contract_input.client)
 
     first = generate_contract(contract_input, case_root)
     second = generate_contract(contract_input, case_root)
@@ -336,6 +386,7 @@ def test_manual_property_source_can_generate_after_explicit_review(tmp_path: Pat
             "warnings_acknowledged": True,
         }
     )
+    _write_reviewed_identity(tmp_path / manual.case_id, manual.client)
 
     generated = generate_contract(manual, tmp_path / manual.case_id)
 
@@ -363,6 +414,7 @@ def test_manual_property_source_can_generate_as_truthfully_unreviewed_poc(
             "warnings_acknowledged": False,
         }
     )
+    _write_reviewed_identity(tmp_path / unreviewed.case_id, unreviewed.client)
 
     generated = generate_contract(unreviewed, tmp_path / unreviewed.case_id)
     stored_input = json.loads(generated.input_path.read_text(encoding="utf-8"))
@@ -474,8 +526,10 @@ def test_generation_rejects_an_unapproved_template(
     monkeypatch.setitem(TEMPLATE_BY_ROLE, ContractRole.BUYER, wrong_template)
 
     case_id = "2026-08-28_120500_pqr678"
+    contract_input = _contract_input(case_id, ContractRole.BUYER)
+    _write_reviewed_identity(tmp_path / case_id, contract_input.client)
     with pytest.raises(ContractGenerationError, match="approved version"):
-        generate_contract(_contract_input(case_id, ContractRole.BUYER), tmp_path / case_id)
+        generate_contract(contract_input, tmp_path / case_id)
 
 
 def test_contract_input_requires_identity_values() -> None:

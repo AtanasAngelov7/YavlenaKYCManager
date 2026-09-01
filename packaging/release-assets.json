@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "assets": {
+    "ocr/PP-OCRv5_mobile_det": "9e302771251744fc258b5c5cbf7774a5bd6b1ac9f277e18ac963eb91bf2cdba2",
+    "ocr/cyrillic_PP-OCRv5_mobile_rec": "15034048d50c2a456333f7583cc3793739d26c35e6bfa0725dfbe828205996dd",
+    "ocr/PP-LCNet_x1_0_doc_ori": "26f4e5a5f97d73af0d110d09ace32d1bc01d5ae43b44a528d9eccfcc916f8070",
+    "browser/chromium-1234": "4dafe5e68ada1bef60038b89215e2503473072f0e5c005bb67dd70328bd0dfea"
+  }
+}

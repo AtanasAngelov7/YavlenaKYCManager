@@ -44,8 +44,8 @@ No paid OCR service is required. Personal documents remain on the local computer
 8. The application displays an editable review form.
 9. The operator corrects and saves the identity snapshot; the local POC has no blocking approval checkbox.
 10. The operator independently chooses contract generation, RMS filling, or both.
-11. Playwright opens a visible browser, signs in from local credentials, fills the supported RMS identity/document/address pages, and remains open for review.
-12. RMS contact data, risk questions, final submission, and PDF retrieval remain manual.
+11. Playwright отваря видим браузър, влиза с локалните credentials и попълва страниците за самоличност, документ и адрес.
+12. Автоматизацията приема предупреждението, избира липса на контактни данни, оставя представителя празен и подава оценката точно веднъж. Браузърът остава отворен върху резултата; неясно подаване никога не се повтаря автоматично.
 13. Generated contract drafts, provenance records, and final JSON are saved in the case directory.
 
 OCR output must never be submitted without operator review in the first version.

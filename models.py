@@ -77,6 +77,18 @@ class ExtractionResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ApprovedIdentitySnapshot(BaseModel):
+    """Case-bound operator-reviewed identity values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(default=1, ge=1, le=1)
+    case_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
+    extracted_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    document: PersonalDocument
+    approved_at: datetime
+
+
 class PropertyDocumentType(str, Enum):
     """Conservative classification of an uploaded Bulgarian property document."""
 

@@ -23,11 +23,12 @@ from models import (
     PropertyExtractionResult,
     personal_document_fingerprint,
 )
-from storage import write_json
+from storage import read_validated_identity_snapshot, write_json
+from runtime_paths import RESOURCE_ROOT
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-TEMPLATE_DIRECTORY = PROJECT_ROOT / "documents" / "templates"
+PROJECT_ROOT = RESOURCE_ROOT
+TEMPLATE_DIRECTORY = RESOURCE_ROOT / "documents" / "templates"
 TEMPLATE_BY_ROLE = {
     ContractRole.BUYER: TEMPLATE_DIRECTORY / "buy_contract_template.docx",
     ContractRole.SELLER: TEMPLATE_DIRECTORY / "sale_contract_one_seller_template.docx",
@@ -86,6 +87,8 @@ def generate_contract(contract_input: ContractInput, case_root: Path) -> Generat
     resolved_case_root = case_root.resolve()
     if resolved_case_root.name != contract_input.case_id:
         raise ContractGenerationError("The contract case does not match the active case directory.")
+
+    _validate_active_identity(contract_input, resolved_case_root)
 
     output_directory = (resolved_case_root / "output").resolve()
     if output_directory.parent != resolved_case_root:
@@ -146,6 +149,43 @@ def generate_contract(contract_input: ContractInput, case_root: Path) -> Generat
         manifest_path=manifest_path,
         manifest=manifest,
     )
+
+
+def contract_input_matches_active_sources(
+    contract_input: ContractInput,
+    case_root: Path,
+) -> bool:
+    """Return whether a stored draft still matches the case's active source records."""
+
+    resolved_case_root = case_root.resolve()
+    if resolved_case_root.name != contract_input.case_id:
+        return False
+    try:
+        _validate_active_identity(contract_input, resolved_case_root)
+        _validate_active_property_source(contract_input, resolved_case_root)
+    except ContractGenerationError:
+        return False
+    return True
+
+
+def _validate_active_identity(contract_input: ContractInput, case_root: Path) -> None:
+    """Require the draft client to match the current case-bound reviewed identity."""
+
+    try:
+        validated = read_validated_identity_snapshot(
+            case_root / "final.json",
+            expected_case_id=contract_input.case_id,
+        )
+    except ValueError as error:
+        raise ContractGenerationError(
+            "The current reviewed identity is missing, stale, or invalid. Review and save it again."
+        ) from error
+    if personal_document_fingerprint(validated.snapshot.document) != personal_document_fingerprint(
+        contract_input.client
+    ):
+        raise ContractGenerationError(
+            "The contract client differs from the current reviewed identity. Reload the case and try again."
+        )
 
 
 def _template_context(contract_input: ContractInput) -> dict[str, str]:
@@ -262,7 +302,9 @@ def _format_choice(choice: BinaryChoice) -> str:
 
 
 def _format_bulgarian_date(value: object) -> str:
-    return value.strftime("%d.%m.%Y г.")
+    # Keep locale-sensitive strftime input ASCII-only. Windows' default C
+    # locale on Python 3.11 cannot encode Cyrillic characters in the format.
+    return f"{value.strftime('%d.%m.%Y')} г."
 
 
 def _validate_controlled_template(role: ContractRole, path: Path) -> None:
